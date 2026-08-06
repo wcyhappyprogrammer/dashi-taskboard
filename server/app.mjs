@@ -1477,6 +1477,7 @@ export function createTaskboardServer(options = {}) {
   const localAutomation = options.localAutomationService ?? createLocalAutomationService({
     database,
     aiChat,
+    events,
     skillPath: resolved.skillPath,
     configPath: resolved.localAutomationPath,
   });
@@ -1489,6 +1490,7 @@ export function createTaskboardServer(options = {}) {
   const workflowRuntime = options.workflowRuntime ?? createWorkflowRuntime({
     lark: larkCli,
     database,
+    events,
   });
   larkNotifier.attach(events);
   larkTaskSync.attach(events);
@@ -1720,6 +1722,7 @@ export function createTaskboardServer(options = {}) {
         }
         if (body.data && typeof body.data === "object") {
           return sendJson(response, 200, await workflowRuntime.runNodeData({
+            projectId: body.projectId ? validateProjectId(body.projectId) : null,
             data: body.data,
             inputText: typeof body.inputText === "string" ? body.inputText : undefined,
           }));

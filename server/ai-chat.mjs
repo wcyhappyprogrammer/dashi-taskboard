@@ -413,6 +413,20 @@ export class AiChatService {
     }
   }
 
+  async waitForRun(runId) {
+    const pending = this.completions.get(runId);
+    if (pending) {
+      await pending.catch(() => {});
+      return this.getRun(runId);
+    }
+    let run = this.getRun(runId);
+    while (run.status === "running") {
+      await wait(100);
+      run = this.getRun(runId);
+    }
+    return run;
+  }
+
   async interrupt(runId) {
     let run = this.getRun(runId);
     if (run.status !== "running") return run;

@@ -72,6 +72,30 @@ export function buildTaskboardAutomationPrompt(request) {
   ].join("\n");
 }
 
+/**
+ * Prompt for API-only providers (no local shell / taskctl).
+ * The server claims the issue and posts the model reply as a comment.
+ */
+export function buildApiProviderAutomationPrompt(task) {
+  const identifier = task?.identifier || task?.id || "";
+  const title = task?.title || "(untitled)";
+  const description = typeof task?.description === "string" && task.description.trim()
+    ? task.description.trim()
+    : "(无描述)";
+  return [
+    "你正在 Taskboard 自动认领流程中。服务端已代你认领该议题；你没有 shell 或 taskctl，请直接给出可交付结论。",
+    "",
+    `议题：${identifier} ${title}`,
+    "描述：",
+    description,
+    "",
+    "请用中文输出：",
+    "1. 结论摘要",
+    "2. 关键要点（可含具体名称/数据）",
+    "3. 风险与后续建议",
+  ].join("\n");
+}
+
 export function buildTaskboardAutomationSpec(request) {
   return {
     kind: "cron",

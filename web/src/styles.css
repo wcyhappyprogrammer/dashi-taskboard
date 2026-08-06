@@ -1372,7 +1372,35 @@ kbd {
   color: var(--text-tertiary);
 }
 
+.project-automation-note.is-error {
+  color: var(--danger);
+}
+
 .project-automation-error {
+  color: var(--danger);
+}
+
+.ai-provider-health {
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--surface);
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text-secondary);
+}
+
+.ai-provider-health strong {
+  display: block;
+  margin-bottom: 2px;
+  color: var(--text-primary);
+}
+
+.ai-provider-health.is-ready {
+  color: var(--success);
+}
+
+.ai-provider-health.is-blocked {
   color: var(--danger);
 }
 

@@ -149,14 +149,23 @@ export function LarkSettings({ projects, onClose }: LarkSettingsProps) {
     setBanner(null);
     setError(null);
     try {
+      const notify = { ...config.notify };
+      if (notify.enabled) {
+        if (notify.recipientType === "chat" && !notify.chatId?.trim()) {
+          throw new Error("启用群聊通知时请先选择或填写群聊");
+        }
+        if (notify.recipientType === "user" && !notify.userId?.trim()) {
+          throw new Error("启用指定用户通知时请填写用户 ID");
+        }
+      }
       const response = await saveLarkSettings({
         enabled: config.enabled,
         executable: config.executable,
         defaultAs: config.defaultAs,
-        notify: config.notify,
+        notify,
         sync: {
           enabled: config.sync.enabled,
-          direction: config.sync.direction,
+          direction: "pull",
           projectId: config.sync.projectId,
           taskListGuid: config.sync.taskListGuid,
           intervalSeconds: config.sync.intervalSeconds,
@@ -164,7 +173,11 @@ export function LarkSettings({ projects, onClose }: LarkSettingsProps) {
         },
       });
       setConfig(response.config);
-      setBanner("已保存飞书配置");
+      setBanner(
+        response.config.notify.enabled
+          ? "已保存飞书配置（通知已启用）"
+          : "已保存飞书配置",
+      );
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -284,9 +297,9 @@ export function LarkSettings({ projects, onClose }: LarkSettingsProps) {
         <p className="ai-provider-form-empty">正在加载配置…</p>
       ) : (
         <div className="ai-provider-form lark-settings-form">
-          {(banner || error || config.lastError) && (
+          {(error || config.lastError || banner) && (
             <p className={`ai-provider-settings-banner${error || config.lastError ? " is-error" : ""}`}>
-              {error || config.lastError || banner}
+              {error || (config.lastError ? `飞书错误：${config.lastError}` : null) || banner}
             </p>
           )}
 
@@ -353,7 +366,10 @@ export function LarkSettings({ projects, onClose }: LarkSettingsProps) {
 
           <div className="ai-provider-form-heading">
             <h2>任务板通知</h2>
-            <p>议题变更后通过 lark-cli 发飞书消息；失败不阻断任务 API。</p>
+            <p>
+              议题变更后通过 lark-cli 发飞书消息。选择群聊并保存后会自动启用通知；
+              失败不阻断任务 API，错误显示在本页顶部。
+            </p>
           </div>
 
           <label className="ai-provider-field">
@@ -441,7 +457,11 @@ export function LarkSettings({ projects, onClose }: LarkSettingsProps) {
                     value={config.notify.chatId}
                     onChange={(event) => setConfig((current) => ({
                       ...current,
-                      notify: { ...current.notify, chatId: event.target.value },
+                      notify: {
+                        ...current.notify,
+                        chatId: event.target.value,
+                        enabled: event.target.value ? true : current.notify.enabled,
+                      },
                     }))}
                   >
                     <option value="">请选择群聊</option>
@@ -468,7 +488,11 @@ export function LarkSettings({ projects, onClose }: LarkSettingsProps) {
                   placeholder="oc_…"
                   onChange={(event) => setConfig((current) => ({
                     ...current,
-                    notify: { ...current.notify, chatId: event.target.value },
+                    notify: {
+                      ...current.notify,
+                      chatId: event.target.value,
+                      enabled: event.target.value.trim() ? true : current.notify.enabled,
+                    },
                   }))}
                 />
               </label>
@@ -477,6 +501,7 @@ export function LarkSettings({ projects, onClose }: LarkSettingsProps) {
                   当前：
                   {chats.find((chat) => chat.chatId === config.notify.chatId)?.name
                     || config.notify.chatId}
+                  {config.notify.enabled ? " · 通知已开" : " · 保存后将自动开启通知"}
                 </p>
               )}
             </div>
@@ -500,7 +525,10 @@ export function LarkSettings({ projects, onClose }: LarkSettingsProps) {
 
           <div className="ai-provider-form-heading">
             <h2>任务同步</h2>
-            <p>先从飞书任务拉取到看板；完成状态可回写飞书。</p>
+            <p>
+              当前仅支持「从飞书拉取到看板」；看板完成状态可选择回写飞书。
+              不支持真正的双向实时同步。
+            </p>
           </div>
 
           <label className="ai-provider-field">

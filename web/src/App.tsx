@@ -98,6 +98,7 @@ import { createRevisionPoller, getRevisionPollingInterval } from "./revisionPoll
 type ConnectionState = "connecting" | "live" | "reconnecting";
 type Theme = "light" | "dark";
 type BoardView = "issues" | "workflow";
+// Keep hidden until more workflow nodes are production-ready; feishu + issue actions already run via API.
 const SHOW_WORKFLOW_BOARD_ENTRY = false;
 
 const WorkflowBoard = lazy(() => import("./components/WorkflowBoard").then((module) => ({
@@ -146,6 +147,16 @@ interface AutomationQuotaStatus {
   reason?: "api-key" | "local";
 }
 
+interface AutomationLastRun {
+  at: number | null;
+  outcome: "succeeded" | "failed" | "skipped" | "idle" | null;
+  error: string | null;
+  threadId: string | null;
+  issueId: string | null;
+  issueIdentifier: string | null;
+  mode: "cli" | "api" | null;
+}
+
 interface ProjectAutomationRecord {
   automationId?: string;
   codexProjectId: string;
@@ -157,6 +168,7 @@ interface ProjectAutomationRecord {
   provider?: AiChatProviderId;
   model: string;
   reasoningEffort: string;
+  lastRun?: AutomationLastRun | null;
 }
 
 type ProjectAutomations = Record<string, ProjectAutomationRecord>;
@@ -168,6 +180,7 @@ interface AutomationHostItem {
   model: string;
   reasoningEffort: string;
   rrule: string;
+  lastRun?: AutomationLastRun | null;
 }
 
 interface AutomationHostResponse {
@@ -184,6 +197,7 @@ interface AutomationHostResponse {
     provider?: AiChatProviderId | null;
     model: string;
     reasoningEffort: string;
+    lastRun?: AutomationLastRun | null;
   };
   error?: string;
 }
@@ -873,6 +887,7 @@ export function App() {
         && current[projectId]?.provider === record.provider
         && current[projectId]?.model === record.model
         && current[projectId]?.reasoningEffort === record.reasoningEffort
+        && JSON.stringify(current[projectId]?.lastRun ?? null) === JSON.stringify(record.lastRun ?? null)
       ) {
         return current;
       }
@@ -1038,6 +1053,7 @@ export function App() {
         ...(item.provider ? { provider: item.provider } : stored.provider ? { provider: stored.provider } : {}),
         model: item.model,
         reasoningEffort: item.reasoningEffort,
+        lastRun: item.lastRun ?? response.policy?.lastRun ?? stored.lastRun ?? null,
       });
     } catch (error) {
       setAutomationError(error instanceof Error ? error.message : "无法读取自动化状态");
@@ -1098,6 +1114,7 @@ export function App() {
         ...(provider ? { provider } : {}),
         model: nextOptions.model,
         reasoningEffort: nextOptions.reasoningEffort,
+        lastRun: item?.lastRun ?? response.policy?.lastRun ?? stored?.lastRun ?? null,
       });
     } catch (error) {
       writeProjectAutomation(selectedProjectId, previousRecord);
@@ -2293,7 +2310,7 @@ export function App() {
                 catalog={automationCatalog}
                 runtimeNote={
                   automationProjectContext.mode === "local"
-                    ? "由本机 Taskboard 服务调度。先选 AI Provider，再选对应模型；间隔可填 1–180 分钟。"
+                    ? "由本机 Taskboard 服务调度。Codex/Claude Code 可改代码并流转议题；DeepSeek 等 API 仅做分析认领（服务端代认领+评论，不写仓库）。"
                     : null
                 }
                 workspacePathHint={

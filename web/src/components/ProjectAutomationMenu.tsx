@@ -26,8 +26,19 @@ interface AutomationOptions {
   reasoningEffort: string;
 }
 
+interface AutomationLastRun {
+  at: number | null;
+  outcome: "succeeded" | "failed" | "skipped" | "idle" | null;
+  error: string | null;
+  threadId: string | null;
+  issueId: string | null;
+  issueIdentifier: string | null;
+  mode: "cli" | "api" | null;
+}
+
 interface AutomationState extends AutomationOptions {
   status: AutomationStatus;
+  lastRun?: AutomationLastRun | null;
   quota?: {
     state: AutomationQuotaState;
     checkedAt: number;
@@ -155,6 +166,9 @@ export function ProjectAutomationMenu({
   const selectedModel = useMemo(() => (
     providerModels.find((model) => model.slug === draft.model) ?? providerModels[0] ?? null
   ), [draft.model, providerModels]);
+
+  const selectedProviderMode = selectedProvider?.supportsSandbox === false ? "api" : "cli";
+  const lastRun = automation?.lastRun ?? null;
 
   const hostEfforts = useMemo(() => (
     getAutomationModel(draft.model as AutomationModel)?.efforts
@@ -423,10 +437,32 @@ export function ProjectAutomationMenu({
               {availableProviders.map((provider) => (
                 <option key={provider.id} value={provider.id}>
                   {PROVIDER_LABELS[provider.id] ?? provider.displayName}
+                  {provider.supportsSandbox === false ? " · 分析认领" : " · 可改代码"}
                 </option>
               ))}
             </select>
           </label>
+          {selectedProvider && (
+            <p className="project-automation-note">
+              {selectedProviderMode === "api"
+                ? "当前为 API Provider：服务端代认领并写评论，不会修改本地仓库代码。"
+                : "当前为 CLI Provider：Agent 可通过 taskctl 改代码并流转议题。"}
+            </p>
+          )}
+          {lastRun && (
+            <p className={`project-automation-note${lastRun.outcome === "failed" ? " is-error" : ""}`}>
+              上次：
+              {lastRun.outcome === "succeeded" && "成功"}
+              {lastRun.outcome === "failed" && "失败"}
+              {lastRun.outcome === "skipped" && "已跳过"}
+              {lastRun.outcome === "idle" && "无待办"}
+              {!lastRun.outcome && "未知"}
+              {lastRun.issueIdentifier ? ` · ${lastRun.issueIdentifier}` : ""}
+              {lastRun.mode === "api" ? " · 分析认领" : lastRun.mode === "cli" ? " · CLI" : ""}
+              {typeof lastRun.at === "number" ? ` · ${formatLastRunAt(lastRun.at)}` : ""}
+              {lastRun.error ? ` · ${lastRun.error}` : ""}
+            </p>
+          )}
           <label className="project-automation-field">
             <span>模型</span>
             <select
@@ -543,4 +579,13 @@ function formatResetTime(value: number) {
     hour: "2-digit",
     minute: "2-digit",
   }).format(new Date(value * 1_000));
+}
+
+function formatLastRunAt(value: number) {
+  return new Intl.DateTimeFormat("zh-CN", {
+    month: "numeric",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(new Date(value));
 }

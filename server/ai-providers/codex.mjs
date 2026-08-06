@@ -222,13 +222,14 @@ export function createCodexProvider(options = {}) {
     },
 
     async startLogin({ env = process.env, providerConfig = {} } = {}) {
-      const { startCliLogin } = await import("./cli-login.mjs");
+      const { startExternalTerminalLogin } = await import("./cli-login.mjs");
       const executable = await resolveExecutable(providerConfig, env);
-      return startCliLogin({
+      // Browser OAuth via Terminal.app — device-auth often returns 403 until enabled
+      // in ChatGPT Security settings; in-process login dies with Taskboard restarts.
+      return startExternalTerminalLogin({
         providerId: "codex",
         executable,
         args: ["login"],
-        env,
         label: "Codex",
       });
     },

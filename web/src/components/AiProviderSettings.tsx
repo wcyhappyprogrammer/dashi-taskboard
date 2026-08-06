@@ -81,8 +81,8 @@ const PROVIDER_GUIDES: Record<AiChatProviderId, ProviderGuide> = {
     summary: "Codex 通过本机 CLI 接入。若检测失败，请先安装并登录 Codex，再填写可执行文件路径。",
     steps: [
       "安装 Codex CLI（推荐下方安装命令，或下载 Codex 桌面应用）。",
-      "在本页点击「登录」，浏览器完成 ChatGPT 授权后点「检测连接」。",
-      "将 CLI 路径填为 codex，或 Codex.app 内的绝对路径。",
+      "点「登录」会打开系统「终端」跑浏览器授权；授权成功前不要关终端，完成后回来点「检测连接」。",
+      "若终端提示 command not found，CLI 路径填绝对路径：~/.codex/plugins/.plugin-appserver/codex 或 ~/.local/bin/codex。",
     ],
     installCommand: "curl -fsSL https://chatgpt.com/codex/install.sh | sh",
     links: [
@@ -308,6 +308,51 @@ export function AiProviderSettings({
   const scopedEntry = scope === "project"
     ? config?.project?.providers[selectedProvider]
     : config?.global.providers[selectedProvider];
+
+  const health = useMemo(() => {
+    if (draft.enabled === false) {
+      return { state: "已禁用", next: "打开「启用」开关后再检测连接", level: "blocked" as const };
+    }
+    const reason = testResult?.reason || testResult?.detail || "";
+    if (isApiKeyProvider(selectedProvider)) {
+      if (!effective?.hasApiKey && !String(draft.apiKey || "").trim()) {
+        return { state: "Key 缺失", next: "填写 API Key 并保存，再点「检测连接」", level: "blocked" as const };
+      }
+      if (testResult && !testResult.ok) {
+        return { state: "不可用", next: reason || "检查 Base URL / Key 后重试检测", level: "blocked" as const };
+      }
+      if (testResult?.ok) {
+        return { state: "可用", next: "可在 AI 聊天与自动认领中使用", level: "ready" as const };
+      }
+      return { state: "待检测", next: "点击「检测连接」确认 API 可达", level: "pending" as const };
+    }
+    if (testResult && !testResult.ok) {
+      if (/not logged in|未登录/i.test(reason)) {
+        return {
+          state: "未登录",
+          next: selectedProvider === "codex"
+            ? "点「登录」在终端完成浏览器授权（成功前勿关终端），再检测连接"
+            : "点「登录」完成授权后检测连接",
+          level: "blocked" as const,
+        };
+      }
+      if (/not found|ENOENT|未找到|was not found/i.test(reason)) {
+        return { state: "未安装", next: "安装 CLI 或把「CLI 路径」改为绝对路径", level: "blocked" as const };
+      }
+      if (/403|device code/i.test(reason)) {
+        return {
+          state: "登录受阻",
+          next: "设备码若 403，改用终端浏览器登录；或在 ChatGPT Settings → Security 开启 Device code",
+          level: "blocked" as const,
+        };
+      }
+      return { state: "不可用", next: reason || "修正配置后重新检测", level: "blocked" as const };
+    }
+    if (testResult?.ok) {
+      return { state: "可用", next: "可在 AI 聊天与自动认领中使用", level: "ready" as const };
+    }
+    return { state: "待检测", next: "点击「检测连接」确认 CLI 可用", level: "pending" as const };
+  }, [draft.enabled, draft.apiKey, effective?.hasApiKey, selectedProvider, testResult]);
 
   function updateDraft(field: string, value: string | boolean) {
     setDraft((current) => ({ ...current, [field]: value }));
@@ -549,6 +594,16 @@ export function AiProviderSettings({
                 </p>
               </div>
 
+              <div
+                className={`ai-provider-health${
+                  health.level === "ready" ? " is-ready" : health.level === "blocked" ? " is-blocked" : ""
+                }`}
+                role="status"
+              >
+                <strong>健康状态：{health.state}</strong>
+                <span>{health.next}</span>
+              </div>
+
               {PROVIDER_GUIDES[selectedProvider] && (
                 <aside className="ai-provider-guide" aria-label="下载与集成说明">
                   <strong>还没有装好？</strong>
@@ -749,14 +804,24 @@ export function AiProviderSettings({
                 </div>
               )}
 
-              {loginResult?.loginUrl && (
+              {(loginResult?.loginUrl || loginResult?.deviceCode) && (
                 <div className="ai-provider-test-result is-ok">
-                  <strong>登录链接</strong>
-                  <p>
-                    <a href={loginResult.loginUrl} target="_blank" rel="noreferrer">
-                      在浏览器打开登录页
-                    </a>
-                  </p>
+                  <strong>登录指引</strong>
+                  {loginResult.loginUrl && (
+                    <p>
+                      <a href={loginResult.loginUrl} target="_blank" rel="noreferrer">
+                        在浏览器打开登录页
+                      </a>
+                    </p>
+                  )}
+                  {loginResult.deviceCode && (
+                    <p>
+                      设备码：
+                      <code>{loginResult.deviceCode}</code>
+                      {" "}
+                      （在登录页输入；完成后点「检测连接」）
+                    </p>
+                  )}
                 </div>
               )}
 

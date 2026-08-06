@@ -350,6 +350,16 @@ export function subscribeAiChatThread(
   return () => source.close();
 }
 
+export type LocalAutomationLastRun = {
+  at: number | null;
+  outcome: "succeeded" | "failed" | "skipped" | "idle" | null;
+  error: string | null;
+  threadId: string | null;
+  issueId: string | null;
+  issueIdentifier: string | null;
+  mode: "cli" | "api" | null;
+};
+
 export async function getLocalAutomation(
   projectId: string,
   signal?: AbortSignal,
@@ -357,26 +367,32 @@ export async function getLocalAutomation(
   item?: {
     id: string;
     status: "ACTIVE" | "PAUSED";
+    provider?: string | null;
     model: string;
     reasoningEffort: string;
     rrule: string;
     nextRunAt?: number | null;
+    lastRun?: LocalAutomationLastRun | null;
   };
   items?: Array<{
     id: string;
     status: "ACTIVE" | "PAUSED";
+    provider?: string | null;
     model: string;
     reasoningEffort: string;
     rrule: string;
     nextRunAt?: number | null;
+    lastRun?: LocalAutomationLastRun | null;
   }>;
   policy?: {
     automationId?: string;
     enabledByUser: boolean;
     quotaAware: boolean;
     intervalMinutes: number;
+    provider?: string | null;
     model: string;
     reasoningEffort: string;
+    lastRun?: LocalAutomationLastRun | null;
   } | null;
   quota?: {
     state: "available" | "blocked" | "unknown" | "unavailable";
@@ -404,6 +420,7 @@ export async function saveLocalAutomation(input: {
     reasoningEffort: string;
     rrule: string;
     nextRunAt?: number | null;
+    lastRun?: LocalAutomationLastRun | null;
   };
   policy?: {
     automationId?: string;
@@ -413,6 +430,7 @@ export async function saveLocalAutomation(input: {
     provider?: string | null;
     model: string;
     reasoningEffort: string;
+    lastRun?: LocalAutomationLastRun | null;
   };
   quota?: {
     state: "available" | "blocked" | "unknown" | "unavailable";

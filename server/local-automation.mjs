@@ -1,10 +1,12 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 
-import { ApiError } from "./database.mjs";
+import { agentActorForProvider } from "../shared/ai-agent-actor.mjs";
 import {
+  buildApiProviderAutomationPrompt,
   buildTaskboardAutomationPrompt,
 } from "../shared/taskboard-automation.mjs";
+import { ApiError } from "./database.mjs";
 
 const MIN_INTERVAL_MINUTES = 1;
 const MAX_INTERVAL_MINUTES = 180;
@@ -28,6 +30,19 @@ function rruleFor(intervalMinutes) {
   return `RRULE:FREQ=MINUTELY;INTERVAL=${intervalMinutes}`;
 }
 
+function lastRunFromRecord(record) {
+  if (!record?.lastRunAt && !record?.lastRunOutcome) return null;
+  return {
+    at: record.lastRunAt ?? null,
+    outcome: record.lastRunOutcome ?? null,
+    error: record.lastRunError ?? null,
+    threadId: record.lastThreadId ?? null,
+    issueId: record.lastIssueId ?? null,
+    issueIdentifier: record.lastIssueIdentifier ?? null,
+    mode: record.lastRunMode ?? null,
+  };
+}
+
 function itemFromRecord(record) {
   return {
     id: record.automationId,
@@ -37,6 +52,7 @@ function itemFromRecord(record) {
     reasoningEffort: record.reasoningEffort,
     rrule: rruleFor(record.intervalMinutes),
     nextRunAt: record.nextRunAt ?? null,
+    lastRun: lastRunFromRecord(record),
   };
 }
 
@@ -49,6 +65,7 @@ function policyFromRecord(record) {
     provider: record.provider ?? null,
     model: record.model,
     reasoningEffort: record.reasoningEffort,
+    lastRun: lastRunFromRecord(record),
   };
 }
 
@@ -64,9 +81,20 @@ function normalizeIntervalMinutes(value) {
   return minutes;
 }
 
+function collectAssistantReply(events) {
+  const chunks = [];
+  for (const event of events) {
+    if (event.role === "assistant" && event.type === "agent_message" && event.content) {
+      chunks.push(String(event.content).trim());
+    }
+  }
+  return chunks.filter(Boolean).join("\n\n").trim();
+}
+
 export function createLocalAutomationService(options = {}) {
   const database = options.database;
   const aiChat = options.aiChat;
+  const events = options.events ?? null;
   const skillPath = options.skillPath;
   const configPath = options.configPath;
   let store = emptyStore();
@@ -74,6 +102,10 @@ export function createLocalAutomationService(options = {}) {
   let pendingWrite = Promise.resolve();
   let timer = null;
   const runningProjects = new Set();
+
+  function emit(type, value) {
+    events?.emit?.(type, value);
+  }
 
   async function ensureLoaded() {
     if (loaded) return;
@@ -186,6 +218,12 @@ export function createLocalAutomationService(options = {}) {
       model: validated.model.slug,
       reasoningEffort: input.reasoningEffort.trim(),
       lastRunAt: previous?.lastRunAt ?? null,
+      lastRunOutcome: previous?.lastRunOutcome ?? null,
+      lastRunError: previous?.lastRunError ?? null,
+      lastThreadId: previous?.lastThreadId ?? null,
+      lastIssueId: previous?.lastIssueId ?? null,
+      lastIssueIdentifier: previous?.lastIssueIdentifier ?? null,
+      lastRunMode: previous?.lastRunMode ?? null,
       nextRunAt: enabled
         ? (
           previous?.status === "ACTIVE" && previous?.nextRunAt && !intervalChanged
@@ -234,18 +272,94 @@ export function createLocalAutomationService(options = {}) {
     };
   }
 
+  function patchRunResult(projectId, patch) {
+    const current = store.projects[projectId];
+    if (!current) return;
+    Object.assign(current, patch, { updatedAt: new Date().toISOString() });
+    store.projects[projectId] = current;
+  }
+
+  async function runApiProviderClaim({
+    task,
+    thread,
+    providerId,
+    modelSlug,
+    displayName,
+  }) {
+    const actor = agentActorForProvider(providerId, {
+      displayName,
+      model: modelSlug,
+    });
+    let current = database.getTask(task.id);
+    if (!current || current.status !== "todo" || current.archivedAt) {
+      return { outcome: "skipped", error: "议题已不在 todo" };
+    }
+
+    current = database.updateTask(current.id, current.version, { assignee: actor }, thread.id);
+    emit("task.updated", { task: current });
+    current = database.moveTask(current.id, current.version, "in_progress", undefined, thread.id);
+    emit("task.moved", { task: current });
+
+    const run = await aiChat.startTurn(thread.id, {
+      message: buildApiProviderAutomationPrompt(current),
+      skillIds: [],
+    });
+    const finished = await aiChat.waitForRun(run.id);
+    const reply = collectAssistantReply(database.listAiChatEvents(thread.id));
+    const failed = finished.status === "failed" || !reply;
+    const body = reply
+      || (
+        finished.status === "failed"
+          ? `自动认领失败：${finished.error || "模型未返回结果"}`
+          : "（模型未返回可展示内容）"
+      );
+
+    current = database.getTask(current.id);
+    const comment = database.createComment(current.id, {
+      body,
+      actor,
+      threadId: thread.id,
+    });
+    emit("comment.created", { comment, task: current });
+
+    current = database.getTask(current.id);
+    // Success → in_review; model failure stays in_progress with error comment.
+    if (!failed && current.status === "in_progress") {
+      current = database.moveTask(current.id, current.version, "in_review", undefined, thread.id);
+      emit("task.moved", { task: current });
+    }
+
+    return {
+      outcome: failed ? "failed" : "succeeded",
+      error: failed ? (finished.error || "模型未返回可展示内容") : null,
+    };
+  }
+
   async function runProject(projectId, record) {
-    if (runningProjects.has(projectId)) return;
+    if (runningProjects.has(projectId)) return null;
     runningProjects.add(projectId);
+    let result = {
+      outcome: "skipped",
+      error: null,
+      threadId: null,
+      issueId: null,
+      issueIdentifier: null,
+      mode: null,
+    };
     try {
       const todos = database.listTasks({
         projectId,
         status: "todo",
         archived: "false",
       });
-      if (todos.length === 0) return;
+      if (todos.length === 0) {
+        result = { ...result, outcome: "idle", error: null };
+        return result;
+      }
 
       const task = todos[0];
+      result.issueId = task.id;
+      result.issueIdentifier = task.identifier;
       const catalog = await aiChat.getCatalog(projectId);
       const available = (catalog.providers ?? []).filter((entry) => entry.available);
       if (available.length === 0) {
@@ -262,6 +376,7 @@ export function createLocalAutomationService(options = {}) {
           ?? available[0].id
         );
       const providerInfo = catalog.providers.find((entry) => entry.id === providerId);
+      const providerRuntime = aiChat.providers.get(providerId);
       const modelInfo = (catalog.models ?? []).find((model) => (
         model.provider === providerId && model.slug === record.model
       )) ?? (catalog.models ?? []).find((model) => model.provider === providerId);
@@ -271,7 +386,9 @@ export function createLocalAutomationService(options = {}) {
       const reasoningEffort = modelInfo.supportedReasoningEfforts.includes(record.reasoningEffort)
         ? record.reasoningEffort
         : (modelInfo.defaultReasoningEffort || modelInfo.supportedReasoningEfforts[0] || "medium");
-      const sandbox = providerInfo?.supportsSandbox === false
+      const apiOnly = providerRuntime?.supportsSandbox === false
+        || providerInfo?.supportsSandbox === false;
+      const sandbox = apiOnly
         ? "workspace-write"
         : (catalog.defaults?.[providerId]?.sandbox ?? "workspace-write");
 
@@ -284,6 +401,22 @@ export function createLocalAutomationService(options = {}) {
         reasoningEffort,
         sandbox,
       });
+      result.threadId = thread.id;
+      result.mode = apiOnly ? "api" : "cli";
+
+      if (apiOnly) {
+        const claim = await runApiProviderClaim({
+          task,
+          thread,
+          providerId,
+          modelSlug: modelInfo.slug,
+          displayName: providerRuntime?.displayName || providerInfo?.displayName || providerId,
+        });
+        result.outcome = claim.outcome;
+        result.error = claim.error;
+        return result;
+      }
+
       const message = buildTaskboardAutomationPrompt({
         taskboardProjectId: projectId,
         projectName: thread.origin.projectName,
@@ -293,10 +426,22 @@ export function createLocalAutomationService(options = {}) {
         provider: providerId,
         model: modelInfo.slug,
       });
-      await aiChat.startTurn(thread.id, {
+      const run = await aiChat.startTurn(thread.id, {
         message,
         skillIds: [],
       });
+      const finished = await aiChat.waitForRun(run.id);
+      if (finished.status === "failed") {
+        result.outcome = "failed";
+        result.error = finished.error || "CLI Agent 执行失败";
+      } else if (finished.status === "interrupted") {
+        result.outcome = "failed";
+        result.error = "CLI Agent 被中断";
+      } else {
+        result.outcome = "succeeded";
+        result.error = null;
+      }
+      return result;
     } finally {
       runningProjects.delete(projectId);
     }
@@ -309,17 +454,33 @@ export function createLocalAutomationService(options = {}) {
       if (record.status !== "ACTIVE" || !record.enabledByUser) continue;
       if (runningProjects.has(projectId)) continue;
       if (Number.isFinite(record.nextRunAt) && record.nextRunAt > now) continue;
+      let runResult = {
+        outcome: "failed",
+        error: null,
+        threadId: null,
+        issueId: null,
+        issueIdentifier: null,
+        mode: null,
+      };
       try {
-        await runProject(projectId, record);
+        runResult = await runProject(projectId, record) ?? runResult;
       } catch (error) {
-        console.error(`[local-automation] ${projectId}: ${error?.message || error}`);
+        runResult.outcome = "failed";
+        runResult.error = error?.message || String(error);
+        console.error(`[local-automation] ${projectId}: ${runResult.error}`);
       }
       const current = store.projects[projectId];
       if (!current || current.status !== "ACTIVE") continue;
-      current.lastRunAt = now;
-      current.nextRunAt = computeNextRunAt(current.intervalMinutes, now);
-      current.updatedAt = new Date().toISOString();
-      store.projects[projectId] = current;
+      patchRunResult(projectId, {
+        lastRunAt: now,
+        lastRunOutcome: runResult.outcome,
+        lastRunError: runResult.error,
+        lastThreadId: runResult.threadId,
+        lastIssueId: runResult.issueId,
+        lastIssueIdentifier: runResult.issueIdentifier,
+        lastRunMode: runResult.mode,
+        nextRunAt: computeNextRunAt(current.intervalMinutes, now),
+      });
       await persist();
     }
   }

@@ -6,8 +6,9 @@ import { cappedText } from "./shared.mjs";
 
 const execFileAsync = promisify(execFile);
 const LOGIN_URL_WAIT_MS = 20_000;
-const LOGIN_KEEPALIVE_MS = 10 * 60_000;
+const LOGIN_KEEPALIVE_MS = 15 * 60_000;
 const URL_PATTERN = /https?:\/\/[^\s"'<>]+/i;
+const ANSI_PATTERN = /\u001b\[[0-9;]*m/g;
 
 const activeLogins = new Map();
 
@@ -30,13 +31,96 @@ async function openUrl(url) {
   }
 }
 
-function extractLoginUrl(text) {
-  const match = String(text || "").match(URL_PATTERN);
-  return match?.[0] ?? null;
+function shellQuote(value) {
+  return `'${String(value).replace(/'/g, `'\\''`)}'`;
 }
 
 /**
- * Start a CLI login flow that may print a browser URL.
+ * Run CLI login in macOS Terminal so the OAuth callback listener
+ * (localhost:1455) is not tied to the Taskboard Node process lifetime.
+ */
+export async function startExternalTerminalLogin({
+  providerId,
+  executable,
+  args = [],
+  label = providerId,
+}) {
+  if (process.platform !== "darwin") {
+    return startCliLogin({
+      providerId,
+      executable,
+      args,
+      label,
+    });
+  }
+
+  killLogin(providerId);
+
+  const command = [executable, ...args].map(shellQuote).join(" ");
+  const script = [
+    `clear`,
+    `echo "正在启动 ${label} 登录…"`,
+    `echo "请在浏览器完成授权；成功前不要关闭本窗口。"`,
+    `echo`,
+    command,
+    `status=$?`,
+    `echo`,
+    `if [ "$status" -eq 0 ]; then echo "${label} 登录完成，请回到 Taskboard 点「检测连接」。"; else echo "${label} 登录未完成（exit $status）。"; fi`,
+    `echo`,
+    `read -n 1 -s -r -p "按任意键关闭…"`,
+    `echo`,
+  ].join("; ");
+
+  try {
+    await execFileAsync("osascript", [
+      "-e",
+      `tell application "Terminal"\nactivate\ndo script ${JSON.stringify(script)}\nend tell`,
+    ], {
+      timeout: 10_000,
+    });
+    return {
+      ok: true,
+      providerId,
+      loginUrl: null,
+      deviceCode: null,
+      openedInBrowser: true,
+      detail: `已在「终端」启动 ${label} 浏览器登录。请完成授权并保持终端窗口打开，成功后回来点「检测连接」。`,
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      providerId,
+      detail: cappedText(
+        error?.message
+        || `无法打开终端启动 ${label} 登录，请手动执行：${command}`,
+      ),
+    };
+  }
+}
+
+function stripAnsi(text) {
+  return String(text || "").replace(ANSI_PATTERN, "");
+}
+
+function extractLoginUrl(text) {
+  const clean = stripAnsi(text);
+  // Prefer device-auth URL — it does not need a local callback listener on :1455.
+  const device = clean.match(/https?:\/\/auth\.openai\.com\/codex\/device[^\s"'<>]*/i);
+  if (device) return device[0];
+  const match = clean.match(URL_PATTERN);
+  return match?.[0] ?? null;
+}
+
+function extractDeviceCode(text) {
+  const clean = stripAnsi(text);
+  const labeled = clean.match(/one-time code[^\n]*\n+\s*([A-Z0-9]{4,}-[A-Z0-9]{4,})/i);
+  if (labeled?.[1]) return labeled[1];
+  const generic = clean.match(/\b([A-Z0-9]{4,5}-[A-Z0-9]{4,6})\b/);
+  return generic?.[1] ?? null;
+}
+
+/**
+ * Start a CLI login flow that may print a browser URL / device code.
  * Keeps the child alive so OAuth/device callbacks can complete.
  */
 export function startCliLogin({
@@ -45,6 +129,7 @@ export function startCliLogin({
   args,
   env = process.env,
   label = providerId,
+  expectDeviceCode = false,
 }) {
   killLogin(providerId);
 
@@ -56,6 +141,7 @@ export function startCliLogin({
     let buffer = "";
     let settled = false;
     let loginUrl = null;
+    let deviceCode = null;
 
     const timer = setTimeout(() => {
       activeLogins.delete(providerId);
@@ -75,19 +161,33 @@ export function startCliLogin({
 
     const maybeCapture = async (chunk) => {
       buffer = cappedText(`${buffer}${chunk}`);
-      if (loginUrl) return;
-      const found = extractLoginUrl(buffer);
-      if (!found) return;
-      loginUrl = found;
+      if (settled) return;
+      const foundUrl = extractLoginUrl(buffer);
+      const foundCode = extractDeviceCode(buffer);
+      if (!foundUrl) return;
+      if (expectDeviceCode && !foundCode) return;
+
+      loginUrl = foundUrl;
+      deviceCode = foundCode;
       const opened = await openUrl(loginUrl);
+      const detail = deviceCode
+        ? (
+          opened
+            ? `已打开登录页。请输入设备码 ${deviceCode}，完成后回来点「检测连接」`
+            : `请打开登录链接并输入设备码 ${deviceCode}，完成后点「检测连接」`
+        )
+        : (
+          opened
+            ? `已打开 ${label} 登录页，请在浏览器完成授权后回来点「检测连接」（勿重启服务，需保持登录进程）`
+            : `请打开登录链接完成授权，然后回来点「检测连接」`
+        );
       await finish({
         ok: true,
         providerId,
         loginUrl,
+        deviceCode,
         openedInBrowser: opened,
-        detail: opened
-          ? `已打开 ${label} 登录页，请在浏览器完成授权后回来点「检测连接」`
-          : `请打开登录链接完成授权，然后回来点「检测连接」`,
+        detail,
       });
     };
 
@@ -121,6 +221,7 @@ export function startCliLogin({
           ok: true,
           providerId,
           loginUrl,
+          deviceCode,
           detail: `${label} 登录流程已结束，请点「检测连接」确认状态`,
         });
         return;
@@ -129,7 +230,7 @@ export function startCliLogin({
         ok: false,
         providerId,
         detail: cappedText(
-          buffer.trim()
+          stripAnsi(buffer).trim()
           || `${label} login exited (${signal || code || "unknown"})`,
         ),
       });
@@ -142,6 +243,7 @@ export function startCliLogin({
         ok: true,
         providerId,
         loginUrl: null,
+        deviceCode: null,
         openedInBrowser: false,
         detail: `已启动 ${label} 登录，请在弹出的浏览器/终端中完成授权，然后点「检测连接」`,
       });

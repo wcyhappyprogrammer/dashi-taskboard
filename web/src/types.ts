@@ -250,6 +250,7 @@ export interface AiProviderLoginResult {
   providerId: AiChatProviderId;
   detail?: string;
   loginUrl?: string | null;
+  deviceCode?: string | null;
   openedInBrowser?: boolean;
 }
 

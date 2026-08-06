@@ -81,6 +81,15 @@ function chatCompletionsUrl(baseUrl) {
   return `${trimmed}/chat/completions`;
 }
 
+function modelsUrl(baseUrl) {
+  const trimmed = String(baseUrl || "").replace(/\/$/, "");
+  if (trimmed.endsWith("/models")) return trimmed;
+  if (trimmed.endsWith("/chat/completions")) {
+    return `${trimmed.slice(0, -"/chat/completions".length)}/models`;
+  }
+  return `${trimmed}/models`;
+}
+
 function resolveEnvValue(env, keys = []) {
   for (const key of keys) {
     if (typeof env?.[key] === "string" && env[key].trim()) return env[key].trim();
@@ -153,7 +162,40 @@ export function createOpenAiCompatibleProvider(definition, options = {}) {
 
     async discoverCatalog({ processEnv, providerConfig = {} }) {
       const preferred = providerConfig.defaultModel;
-      const models = resolveModels(processEnv, providerConfig).map((model) => ({
+      let resolved = resolveModels(processEnv, providerConfig);
+
+      // Prefer live /models when key is present and user did not pin a custom list.
+      const pinned = Array.isArray(providerConfig.models) && providerConfig.models.length > 0;
+      const apiKey = resolveApiKey(processEnv, providerConfig);
+      if (!pinned && apiKey) {
+        try {
+          const baseUrl = resolveBaseUrl(processEnv, providerConfig);
+          const response = await fetchImpl(modelsUrl(baseUrl), {
+            headers: {
+              accept: "application/json",
+              authorization: `Bearer ${apiKey}`,
+            },
+          });
+          if (response.ok) {
+            const payload = await response.json();
+            const remote = Array.isArray(payload?.data) ? payload.data : [];
+            const mapped = remote.flatMap((entry) => {
+              const slug = typeof entry?.id === "string" ? entry.id.trim() : "";
+              if (!slug) return [];
+              return [{
+                slug,
+                displayName: slug,
+                description: "Discovered via /models",
+              }];
+            });
+            if (mapped.length > 0) resolved = mapped;
+          }
+        } catch {
+          // Keep static/default model list when discovery fails.
+        }
+      }
+
+      const models = resolved.map((model) => ({
         provider: id,
         slug: model.slug,
         displayName: model.displayName,

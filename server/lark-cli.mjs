@@ -154,6 +154,24 @@ function sanitizeNotify(input = {}, current = emptyConfig().notify) {
   if (userId !== undefined) next.userId = userId ?? "";
   const chatId = optionalString(input.chatId, "notify.chatId", { allowEmpty: true, maxLength: 256 });
   if (chatId !== undefined) next.chatId = chatId ?? "";
+  // Selecting a chat/user implies the user wants notifications; auto-enable.
+  if (next.chatId && next.recipientType === "chat" && enabled === undefined && !current.enabled) {
+    next.enabled = true;
+  }
+  if (next.userId && next.recipientType === "user" && enabled === undefined && !current.enabled) {
+    next.enabled = true;
+  }
+  if (next.enabled) {
+    if (next.recipientType === "chat" && !String(next.chatId || "").trim()) {
+      throw new ApiError(400, "INVALID_FIELD", "启用群聊通知时必须填写 chatId");
+    }
+    if (next.recipientType === "user" && !String(next.userId || "").trim()) {
+      throw new ApiError(400, "INVALID_FIELD", "启用指定用户通知时必须填写 userId");
+    }
+    if (!Array.isArray(next.events) || next.events.length === 0) {
+      next.events = ["task.created", "task.updated", "task.moved"];
+    }
+  }
   return next;
 }
 
@@ -168,10 +186,11 @@ function sanitizeSync(input = {}, current = emptyConfig().sync) {
   const enabled = optionalBoolean(input.enabled, "sync.enabled");
   if (enabled !== undefined) next.enabled = enabled;
   if (input.direction !== undefined) {
+    // Only pull (+ optional done writeback) is implemented; coerce legacy bidirectional.
     if (!["pull", "bidirectional"].includes(input.direction)) {
-      throw new ApiError(400, "INVALID_FIELD", "'sync.direction' must be pull or bidirectional");
+      throw new ApiError(400, "INVALID_FIELD", "'sync.direction' must be pull");
     }
-    next.direction = input.direction;
+    next.direction = "pull";
   }
   if (input.projectId !== undefined) {
     next.projectId = optionalString(input.projectId, "sync.projectId", { allowEmpty: true, maxLength: 128 }) || null;
@@ -235,7 +254,7 @@ function publicConfig(config) {
     },
     sync: {
       enabled: Boolean(config.sync?.enabled),
-      direction: config.sync?.direction === "bidirectional" ? "bidirectional" : "pull",
+      direction: "pull",
       projectId: config.sync?.projectId ?? null,
       taskListGuid: config.sync?.taskListGuid ?? "",
       intervalSeconds: Number.isInteger(config.sync?.intervalSeconds)
