@@ -501,9 +501,32 @@ function requestHeader(request, name) {
   return Array.isArray(value) ? value[0] : value;
 }
 
+function agentActorFromTaskctlRequest(request) {
+  const rawId = requestHeader(request, "x-taskboard-agent-id");
+  const rawName = requestHeader(request, "x-taskboard-agent-name");
+  if (rawId === undefined && rawName === undefined) {
+    return CODEX_AGENT_ACTOR;
+  }
+  if (rawId === undefined || rawName === undefined) {
+    throw new ApiError(400, "INVALID_ACTOR", "Agent identity requires both an ID and name");
+  }
+  const id = stringField(rawId, "X-Taskboard-Agent-Id", { required: true, maxLength: 96 });
+  if (!/^[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$/.test(id)) {
+    throw new ApiError(400, "INVALID_ACTOR", "Agent ID contains unsupported characters");
+  }
+  let decodedName;
+  try {
+    decodedName = decodeURIComponent(rawName);
+  } catch {
+    throw new ApiError(400, "INVALID_ACTOR", "Agent name is not valid URL-encoded text");
+  }
+  const name = stringField(decodedName, "X-Taskboard-Agent-Name", { required: true, maxLength: 120 });
+  return { type: "agent", id, name, avatarUrl: null };
+}
+
 function actorFromRequest(request) {
   if (request.headers["x-taskboard-client"] === "taskctl") {
-    return CODEX_AGENT_ACTOR;
+    return agentActorFromTaskctlRequest(request);
   }
 
   const rawId = requestHeader(request, "x-taskboard-user-id");

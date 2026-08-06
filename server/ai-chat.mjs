@@ -4,6 +4,7 @@ import path from "node:path";
 
 import { ApiError } from "./database.mjs";
 import { resolveAiWorkspace } from "./ai-chat-catalog.mjs";
+import { agentActorForProvider } from "../shared/ai-agent-actor.mjs";
 import { createProviderRegistry, SANDBOXES } from "./ai-providers/index.mjs";
 import { signalProcessGroup } from "./ai-providers/shared.mjs";
 
@@ -332,15 +333,24 @@ export class AiChatService {
           `Provider '${provider.id}' is disabled in AI provider settings`,
         );
       }
-      let processEnv = this.processEnv;
+      const agentActor = agentActorForProvider(provider.id, {
+        displayName: provider.displayName,
+        model: model.slug,
+      });
+      let processEnv = {
+        ...this.processEnv,
+        TASKBOARD_AGENT_ID: agentActor.id,
+        TASKBOARD_AGENT_NAME: agentActor.name,
+        CODEX_THREAD_ID: threadId,
+      };
       let larkAvailable = false;
       if (this.larkCli) {
         try {
-          processEnv = await this.larkCli.ensureLarkOnPath(this.processEnv);
+          processEnv = await this.larkCli.ensureLarkOnPath(processEnv);
           const availability = await this.larkCli.getAiAvailability();
           larkAvailable = availability.available === true;
         } catch {
-          processEnv = this.processEnv;
+          // keep agent identity env even if Lark PATH enrichment fails
         }
       }
       const handle = await provider.startTurn({

@@ -265,19 +265,16 @@ export function ProjectAutomationMenu({
     const models = (catalog?.models ?? []).filter((model) => model.provider === providerId);
     const preferred = catalog?.defaults?.[providerId]?.model;
     const model = models.find((entry) => entry.slug === preferred) ?? models[0];
-    const effort = model
-      ? (
-        model.supportedReasoningEfforts.includes(
-          catalog?.defaults?.[providerId]?.reasoningEffort ?? "",
-        )
-          ? (catalog?.defaults?.[providerId]?.reasoningEffort as string)
-          : (model.defaultReasoningEffort || model.supportedReasoningEfforts[0] || "medium")
-      )
-      : draft.reasoningEffort;
+    if (!model) return;
+    const effort = model.supportedReasoningEfforts.includes(
+      catalog?.defaults?.[providerId]?.reasoningEffort ?? "",
+    )
+      ? (catalog?.defaults?.[providerId]?.reasoningEffort as string)
+      : (model.defaultReasoningEffort || model.supportedReasoningEfforts[0] || "medium");
     submitChange({
       ...draft,
       provider: providerId,
-      model: model?.slug ?? draft.model,
+      model: model.slug,
       reasoningEffort: effort,
     });
   };

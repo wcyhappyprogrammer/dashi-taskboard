@@ -59,8 +59,12 @@ export function buildTaskboardAutomationName(request) {
 }
 
 export function buildTaskboardAutomationPrompt(request) {
+  const providerLine = request.provider || request.model
+    ? `当前调度使用 Provider「${request.provider ?? "unknown"}」模型「${request.model ?? "unknown"}」；taskctl 写入会记到对应 Agent 身份。`
+    : null;
   return [
     `[$manage-taskboard](${request.skillPath}) e-taskboard 每 ${request.intervalMinutes} 分钟检查任务面板中的「${request.projectName}」项目（项目 ID：${request.taskboardProjectId}，项目目录：${request.workspacePath}）。`,
+    ...(providerLine ? [providerLine] : []),
     "每次仅处理一个 todo：先用 issue get 读取最新议题内容，并用 comment list 读取全部评论，确认是否包含已完成后被打回的返工要求。",
     "认领时使用最新 version 将议题移动到 in_progress；若发生版本冲突或最新状态已变化，立即跳过，避免多个 Agent 抢同一任务。",
     "若议题已绑定 branch 或 worktree，必须在该议题绑定的开发上下文执行，避免并行 Agent 修改同一工作目录。",

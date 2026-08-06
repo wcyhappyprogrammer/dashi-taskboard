@@ -290,6 +290,8 @@ export function createLocalAutomationService(options = {}) {
         workspacePath: thread.origin.workspacePath,
         skillPath,
         intervalMinutes: record.intervalMinutes,
+        provider: providerId,
+        model: modelInfo.slug,
       });
       await aiChat.startTurn(thread.id, {
         message,

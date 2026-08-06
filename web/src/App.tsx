@@ -215,6 +215,43 @@ const DEFAULT_AUTOMATION_OPTIONS = {
   reasoningEffort: "high",
 } as const;
 
+function normalizeLocalAutomationOptions<T extends {
+  provider?: AiChatProviderId | null;
+  model: string;
+  reasoningEffort: string;
+}>(options: T, catalog: AiChatCatalog | null | undefined): T {
+  if (!catalog) return options;
+  const available = (catalog.providers ?? []).filter((entry) => entry.available);
+  if (available.length === 0) return options;
+  const provider = available.find((entry) => entry.id === options.provider)
+    ?? available.find((entry) => (
+      (catalog.models ?? []).some((model) => (
+        model.provider === entry.id && model.slug === options.model
+      ))
+    ))
+    ?? available[0];
+  const models = (catalog.models ?? []).filter((model) => model.provider === provider.id);
+  const preferred = catalog.defaults?.[provider.id]?.model;
+  const model = models.find((entry) => entry.slug === options.model)
+    ?? models.find((entry) => entry.slug === preferred)
+    ?? models[0];
+  if (!model) {
+    return {
+      ...options,
+      provider: provider.id,
+    };
+  }
+  const effort = model.supportedReasoningEfforts.includes(options.reasoningEffort)
+    ? options.reasoningEffort
+    : (model.defaultReasoningEffort || model.supportedReasoningEfforts[0] || "medium");
+  return {
+    ...options,
+    provider: provider.id,
+    model: model.slug,
+    reasoningEffort: effort,
+  };
+}
+
 const EVENT_NAMES = [
   "task.created",
   "task.updated",
@@ -938,10 +975,16 @@ export function App() {
     setAutomationPending(true);
     setAutomationError(null);
     try {
-      const options = stored ?? {
+      const catalog = automationProjectContext.mode === "local"
+        ? (await refreshAutomationCatalog(selectedProjectId))
+        : automationCatalog;
+      const base = stored ?? {
         status: "PAUSED" as const,
         ...DEFAULT_AUTOMATION_OPTIONS,
       };
+      const options = automationProjectContext.mode === "local"
+        ? normalizeLocalAutomationOptions(base, catalog)
+        : base;
       const response = await sendAutomationRequest(
         stored ? "apply-policy" : "list",
         options,
@@ -1003,7 +1046,9 @@ export function App() {
       setAutomationPending(false);
     }
   }, [
+    automationCatalog,
     automationProjectContext,
+    refreshAutomationCatalog,
     selectedProjectId,
     sendAutomationRequest,
     writeProjectAutomation,
@@ -1029,8 +1074,11 @@ export function App() {
     setAutomationPending(true);
     setAutomationError(null);
     try {
+      const catalog = automationProjectContext.mode === "local"
+        ? (automationCatalog ?? await refreshAutomationCatalog(selectedProjectId))
+        : automationCatalog;
       const nextOptions = automationProjectContext.mode === "local"
-        ? { ...options, quotaAware: false }
+        ? { ...normalizeLocalAutomationOptions(options, catalog), quotaAware: false }
         : options;
       const response = await sendAutomationRequest("apply-policy", nextOptions, stored?.automationId);
       const item = isAutomationHostItem(response.item) ? response.item : undefined;
@@ -1059,8 +1107,10 @@ export function App() {
       setAutomationPending(false);
     }
   }, [
+    automationCatalog,
     automationProjectContext,
     projectAutomations,
+    refreshAutomationCatalog,
     selectedProjectId,
     sendAutomationRequest,
     writeProjectAutomation,
@@ -2252,7 +2302,6 @@ export function App() {
                   ?? null
                 }
                 onOpen={() => {
-                  void refreshAutomationCatalog();
                   void reconcileProjectAutomation();
                 }}
                 onChange={(options) => void saveProjectAutomation(options)}

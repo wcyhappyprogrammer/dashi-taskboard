@@ -308,17 +308,32 @@ function createApiClient(overrides, { baseUrl: explicitBaseUrl } = {}) {
   const env = overrides.env ?? process.env;
   const baseUrl = normalizeBaseUrl(explicitBaseUrl ?? env.CODEX_TASKBOARD_URL ?? DEFAULT_API_URL);
 
+  function taskctlHeaders(extra = {}) {
+    const headers = {
+      "x-taskboard-client": "taskctl",
+      ...extra,
+    };
+    const agentId = typeof env.TASKBOARD_AGENT_ID === "string" ? env.TASKBOARD_AGENT_ID.trim() : "";
+    const agentName = typeof env.TASKBOARD_AGENT_NAME === "string" ? env.TASKBOARD_AGENT_NAME.trim() : "";
+    if (agentId && agentName) {
+      headers["x-taskboard-agent-id"] = agentId;
+      headers["x-taskboard-agent-name"] = encodeURIComponent(agentName);
+    }
+    return headers;
+  }
+
   return {
     async request(method, pathname, body) {
       let response;
       try {
         response = await fetchImplementation(new URL(pathname, `${baseUrl}/`), {
           method,
-          headers: {
-            accept: "application/json",
-            "x-taskboard-client": "taskctl",
-            ...(body === undefined ? {} : { "content-type": "application/json" }),
-          },
+          headers: taskctlHeaders(
+            body === undefined ? { accept: "application/json" } : {
+              accept: "application/json",
+              "content-type": "application/json",
+            },
+          ),
           ...(body === undefined ? {} : { body: JSON.stringify(body) }),
         });
       } catch (error) {
@@ -350,10 +365,7 @@ function createApiClient(overrides, { baseUrl: explicitBaseUrl } = {}) {
       let response;
       try {
         response = await fetchImplementation(new URL(pathname, `${baseUrl}/`), {
-          headers: {
-            accept: "*/*",
-            "x-taskboard-client": "taskctl",
-          },
+          headers: taskctlHeaders({ accept: "*/*" }),
         });
       } catch (error) {
         throw new TaskctlError(`Cannot reach taskboard service at ${baseUrl}`, {
