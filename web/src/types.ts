@@ -57,7 +57,27 @@ export type AiChatSandbox = "read-only" | "workspace-write" | "danger-full-acces
 export type AiChatThreadStatus = "idle" | "running" | "failed";
 export type AiChatRunStatus = "running" | "completed" | "failed" | "interrupted";
 
+export type AiChatProviderId =
+  | "codex"
+  | "claude-code"
+  | "anthropic"
+  | "deepseek"
+  | "kimi"
+  | "volcengine"
+  | "aliyun"
+  | "tencent";
+
+export interface AiChatProviderInfo {
+  id: AiChatProviderId;
+  displayName: string;
+  available: boolean;
+  reason?: string;
+  supportsSkills: boolean;
+  supportsSandbox: boolean;
+}
+
 export interface AiChatModel {
+  provider: AiChatProviderId;
   slug: string;
   displayName: string;
   description: string;
@@ -67,6 +87,7 @@ export interface AiChatModel {
 }
 
 export interface AiChatSkill {
+  provider?: AiChatProviderId;
   id: string;
   label: string;
   description: string;
@@ -80,10 +101,156 @@ export interface AiChatAttachmentInput {
   dataBase64: string;
 }
 
+export interface LarkAvailability {
+  available: boolean;
+  installed: boolean;
+  loggedIn: boolean;
+  executable?: string;
+  detail?: string;
+  skillsInstalledAt?: string | null;
+}
+
 export interface AiChatCatalog {
+  providers: AiChatProviderInfo[];
   models: AiChatModel[];
   skills: AiChatSkill[];
   sandboxes: string[];
+  defaults?: Partial<Record<AiChatProviderId, {
+    model: string | null;
+    reasoningEffort: string | null;
+    sandbox: string | null;
+  }>>;
+  lark?: LarkAvailability;
+}
+
+export interface LarkSettingsConfig {
+  enabled: boolean;
+  executable: string;
+  defaultAs: "user" | "bot";
+  lastError: string | null;
+  lastTestedAt: string | null;
+  notify: {
+    enabled: boolean;
+    events: string[];
+    recipientType: "self" | "user" | "chat";
+    userId: string;
+    chatId: string;
+  };
+  sync: {
+    enabled: boolean;
+    direction: "pull" | "bidirectional";
+    projectId: string | null;
+    taskListGuid: string;
+    intervalSeconds: number;
+    writeback: boolean;
+    mappingCount: number;
+  };
+  ai: {
+    skillsInstalledAt: string | null;
+    skillsDetail: string | null;
+  };
+}
+
+export interface LarkSettingsResponse {
+  config: LarkSettingsConfig;
+  availability: LarkAvailability;
+}
+
+export interface LarkTestResult {
+  ok: boolean;
+  installed: boolean;
+  loggedIn: boolean;
+  executable: string;
+  detail?: string;
+  identity?: string | null;
+  data?: unknown;
+}
+
+export interface LarkChatOption {
+  chatId: string;
+  name: string;
+  description: string;
+  chatMode: string | null;
+  external: boolean;
+}
+
+export interface LarkSyncResult {
+  ok: boolean;
+  skipped?: boolean;
+  reason?: string;
+  created?: number;
+  updated?: number;
+  remoteCount?: number;
+  mappingCount?: number;
+}
+
+export interface WorkflowRunResult {
+  kind: string;
+  ok: boolean;
+  result?: unknown;
+}
+
+export interface AiProviderSettingsPatch {
+  enabled?: boolean;
+  executable?: string | null;
+  baseUrl?: string | null;
+  models?: string[] | null;
+  defaultModel?: string | null;
+  reasoningEffort?: string | null;
+  sandbox?: AiChatSandbox | null;
+}
+
+export interface AiProviderSettingsEntry extends AiProviderSettingsPatch {
+  hasApiKey?: boolean;
+  apiKeyLastFour?: string | null;
+  overriddenFields?: string[];
+}
+
+export interface AiProviderEffectiveConfig extends AiProviderSettingsEntry {
+  id: AiChatProviderId;
+  displayName: string;
+  supportsSkills: boolean;
+  supportsSandbox: boolean;
+  enabled: boolean;
+  source?: Record<string, string>;
+}
+
+export interface AiProviderSettingsResponse {
+  keychainSupported: boolean;
+  providers: Array<{
+    id: AiChatProviderId;
+    displayName: string;
+    supportsSkills: boolean;
+    supportsSandbox: boolean;
+  }>;
+  global: {
+    providers: Partial<Record<AiChatProviderId, AiProviderSettingsEntry>>;
+  };
+  project: {
+    projectId: string;
+    providers: Partial<Record<AiChatProviderId, AiProviderSettingsEntry>>;
+  } | null;
+  effective: {
+    providers: Partial<Record<AiChatProviderId, AiProviderEffectiveConfig>>;
+  };
+}
+
+export interface AiProviderTestResult {
+  ok: boolean;
+  providerId: AiChatProviderId;
+  reason?: string;
+  detail?: string;
+  modelCount?: number;
+  models?: Array<{ slug: string; displayName: string }>;
+  supportsCliLogin?: boolean;
+}
+
+export interface AiProviderLoginResult {
+  ok: boolean;
+  providerId: AiChatProviderId;
+  detail?: string;
+  loginUrl?: string | null;
+  openedInBrowser?: boolean;
 }
 
 export interface AiChatOrigin {
@@ -109,6 +276,8 @@ export interface AiChatThread {
   title: string;
   status: AiChatThreadStatus;
   origin: AiChatOrigin;
+  provider: AiChatProviderId;
+  providerSessionId: string | null;
   codexThreadId: string | null;
   model: string;
   reasoningEffort: string;

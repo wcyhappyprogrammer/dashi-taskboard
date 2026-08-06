@@ -143,6 +143,7 @@ if (args[0] === "app-server") {
     codexExecutable: executable,
     codexStatePath,
     manageTaskboardSkillPath: "/fixture/manage-taskboard/SKILL.md",
+    providerIds: ["codex"],
     processEnv: {
       ...process.env,
       FAKE_CAPTURE_PATH: capturePath,
@@ -172,6 +173,7 @@ test("Codex turns use stdin, explicit resume ids, server-owned cwd and sanitized
   try {
     const catalog = await fixture.service.getCatalog("project");
     assert.deepEqual(catalog.models, [{
+      provider: "codex",
       slug: "gpt-real",
       displayName: "GPT Real",
       description: "Real fixture",
@@ -179,7 +181,15 @@ test("Codex turns use stdin, explicit resume ids, server-owned cwd and sanitized
       supportedReasoningEfforts: ["low", "medium", "high"],
       serviceTiers: [{ id: "priority", name: "Fast" }],
     }]);
-    assert.deepEqual(catalog.skills, [{ id: "real-skill", label: "Real Skill", scope: "repo" }]);
+    assert.deepEqual(catalog.skills, [{
+      provider: "codex",
+      id: "real-skill",
+      label: "Real Skill",
+      description: "",
+      path: "",
+      scope: "repo",
+    }]);
+    assert.equal(catalog.providers.some((entry) => entry.id === "codex" && entry.available), true);
 
     const thread = await fixture.service.createThread({
       projectId: "project",
@@ -190,7 +200,7 @@ test("Codex turns use stdin, explicit resume ids, server-owned cwd and sanitized
     assert.equal(thread.origin.workspacePath, fixture.workspace);
 
     const first = await fixture.service.startTurn(thread.id, {
-      message: "HIDDEN_SENTINEL first",
+      message: `\uFFFC HIDDEN_SENTINEL first`,
       skillIds: ["real-skill"],
     });
     await waitFor(() => fixture.service.getRun(first.id)?.status !== "running");
@@ -202,6 +212,8 @@ test("Codex turns use stdin, explicit resume ids, server-owned cwd and sanitized
       "exec", "--json", "--color", "never",
       "-C", fixture.workspace,
       "-s", "workspace-write",
+      "-c", 'approval_policy="on-request"',
+      "-c", 'approvals_reviewer="auto_review"',
       "--add-dir", fixture.otherWorkspace,
       "-m", "gpt-real",
       "-c", 'model_reasoning_effort="high"',
@@ -215,6 +227,8 @@ test("Codex turns use stdin, explicit resume ids, server-owned cwd and sanitized
       "exec", "--json", "--color", "never",
       "-C", fixture.workspace,
       "-s", "workspace-write",
+      "-c", 'approval_policy="on-request"',
+      "-c", 'approvals_reviewer="auto_review"',
       "--add-dir", fixture.otherWorkspace,
       "-m", "gpt-real",
       "-c", 'model_reasoning_effort="high"',
@@ -392,10 +406,12 @@ test("startup marks abandoned runs interrupted while preserving the Codex thread
     codexExecutable: path.join(fixture.directory, "fake-codex.mjs"),
     codexStatePath: path.join(fixture.directory, "codex-state.json"),
     manageTaskboardSkillPath: "/fixture/manage-taskboard/SKILL.md",
+    providerIds: ["codex"],
   });
   fixture.service = restarted;
   try {
     assert.equal(restarted.getRun("abandoned").status, "interrupted");
+    assert.equal(restarted.getThread(thread.id).providerSessionId, "preserved-session");
     assert.equal(restarted.getThread(thread.id).codexThreadId, "preserved-session");
   } finally {
     await fixture.close();

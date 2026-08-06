@@ -1440,6 +1440,7 @@ export function WorkflowBoard({
         <aside className="workflow-inspector workflow-step-inspector" aria-label="步骤配置">
           <WorkflowInspector
             node={selectedNode}
+            projectId={projectId}
             projectName={projectName}
             capabilities={workflowCapabilities}
             capabilitiesFailed={workflowCapabilitiesFailed}

@@ -2,20 +2,28 @@ import type {
   ActorIdentity,
   AiChatCatalog,
   AiChatAttachmentInput,
+  AiChatProviderId,
   AiChatRun,
   AiChatSandbox,
   AiChatThread,
   AiChatThreadSnapshot,
+  AiProviderSettingsPatch,
+  AiProviderSettingsResponse,
+  AiProviderTestResult,
   Attachment,
   Comment,
   DevelopmentScan,
   IssueRelationType,
+  LarkSettingsResponse,
+  LarkSyncResult,
+  LarkTestResult,
   Project,
   Task,
   TaskboardMetadata,
   TaskDraft,
   TaskStatus,
   WorkflowCapabilities,
+  WorkflowRunResult,
   WorkflowWorkspaceRecord,
 } from "./types";
 
@@ -111,6 +119,140 @@ export async function getAiChatCatalog(
   );
 }
 
+export async function getAiProviderSettings(
+  projectId?: string | null,
+  signal?: AbortSignal,
+): Promise<AiProviderSettingsResponse> {
+  const query = projectId ? `?projectId=${encodeURIComponent(projectId)}` : "";
+  return request<AiProviderSettingsResponse>(`/api/local/ai-providers/config${query}`, { signal });
+}
+
+export async function saveAiProviderSettings(input: {
+  scope: "global" | "project";
+  projectId?: string;
+  provider: AiChatProviderId;
+  patch?: AiProviderSettingsPatch;
+  apiKey?: string | null;
+  clearApiKey?: boolean;
+}): Promise<AiProviderSettingsResponse> {
+  return request<AiProviderSettingsResponse>("/api/local/ai-providers/config", {
+    method: "PUT",
+    body: JSON.stringify(input),
+  });
+}
+
+export async function deleteAiProviderSettings(input: {
+  scope: "global" | "project";
+  projectId?: string;
+  provider: AiChatProviderId;
+}): Promise<AiProviderSettingsResponse> {
+  const query = new URLSearchParams({
+    scope: input.scope,
+    provider: input.provider,
+  });
+  if (input.projectId) query.set("projectId", input.projectId);
+  return request<AiProviderSettingsResponse>(
+    `/api/local/ai-providers/config?${query}`,
+    { method: "DELETE" },
+  );
+}
+
+export async function testAiProvider(input: {
+  provider: AiChatProviderId;
+  projectId?: string | null;
+  draft?: AiProviderSettingsPatch & { apiKey?: string };
+}): Promise<AiProviderTestResult> {
+  return request<AiProviderTestResult>("/api/local/ai-providers/test", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+export async function loginAiProvider(input: {
+  provider: AiChatProviderId;
+  projectId?: string | null;
+  draft?: AiProviderSettingsPatch;
+}): Promise<{
+  ok: boolean;
+  providerId: AiChatProviderId;
+  detail?: string;
+  loginUrl?: string | null;
+  openedInBrowser?: boolean;
+}> {
+  return request("/api/local/ai-providers/login", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+export async function getLarkSettings(signal?: AbortSignal): Promise<LarkSettingsResponse> {
+  return request<LarkSettingsResponse>("/api/local/lark/config", { signal });
+}
+
+export async function saveLarkSettings(input: {
+  enabled?: boolean;
+  executable?: string;
+  defaultAs?: "user" | "bot";
+  notify?: Partial<LarkSettingsResponse["config"]["notify"]>;
+  sync?: Partial<Omit<LarkSettingsResponse["config"]["sync"], "mappingCount">>;
+}): Promise<LarkSettingsResponse> {
+  return request<LarkSettingsResponse>("/api/local/lark/config", {
+    method: "PUT",
+    body: JSON.stringify(input),
+  });
+}
+
+export async function testLarkConnection(input: {
+  executable?: string;
+} = {}): Promise<LarkTestResult> {
+  return request<LarkTestResult>("/api/local/lark/test", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+export async function listLarkChats(input: {
+  query?: string;
+  as?: "user" | "bot";
+} = {}, signal?: AbortSignal): Promise<{
+  ok: boolean;
+  identity?: string | null;
+  query?: string | null;
+  chats: Array<{
+    chatId: string;
+    name: string;
+    description: string;
+    chatMode: string | null;
+    external: boolean;
+  }>;
+}> {
+  const params = new URLSearchParams();
+  if (input.query?.trim()) params.set("query", input.query.trim());
+  if (input.as) params.set("as", input.as);
+  const query = params.toString();
+  return request(`/api/local/lark/chats${query ? `?${query}` : ""}`, { signal });
+}
+
+export async function installLarkSkills(): Promise<{ ok: boolean; detail?: string; installedAt?: string }> {
+  return request("/api/local/lark/skills/install", { method: "POST", body: "{}" });
+}
+
+export async function runLarkSync(): Promise<LarkSyncResult> {
+  return request<LarkSyncResult>("/api/local/lark/sync", { method: "POST", body: "{}" });
+}
+
+export async function runWorkflowNode(input: {
+  projectId?: string;
+  nodeId?: string;
+  data?: Record<string, unknown>;
+  inputText?: string;
+}): Promise<WorkflowRunResult> {
+  return request<WorkflowRunResult>("/api/local/workflow/run", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
 export async function listAiChatThreads(signal?: AbortSignal): Promise<AiChatThread[]> {
   const data = await request<{ threads: AiChatThread[] }>("/api/local/ai/threads", { signal });
   return data.threads;
@@ -120,6 +262,7 @@ export async function createAiChatThread(input: {
   projectId: string;
   issueId?: string;
   title?: string;
+  provider?: string;
   model?: string;
   reasoningEffort?: string;
   sandbox?: AiChatSandbox;
@@ -145,6 +288,7 @@ export async function updateAiChatThread(
   threadId: string,
   input: {
     title?: string;
+    provider?: string;
     model?: string;
     reasoningEffort?: string;
     sandbox?: AiChatSandbox;
@@ -204,6 +348,97 @@ export function subscribeAiChatThread(
   source.addEventListener("ai.run", () => onHint("ai.run"));
   if (onError) source.addEventListener("error", onError);
   return () => source.close();
+}
+
+export async function getLocalAutomation(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<{
+  item?: {
+    id: string;
+    status: "ACTIVE" | "PAUSED";
+    model: string;
+    reasoningEffort: string;
+    rrule: string;
+    nextRunAt?: number | null;
+  };
+  items?: Array<{
+    id: string;
+    status: "ACTIVE" | "PAUSED";
+    model: string;
+    reasoningEffort: string;
+    rrule: string;
+    nextRunAt?: number | null;
+  }>;
+  policy?: {
+    automationId?: string;
+    enabledByUser: boolean;
+    quotaAware: boolean;
+    intervalMinutes: number;
+    model: string;
+    reasoningEffort: string;
+  } | null;
+  quota?: {
+    state: "available" | "blocked" | "unknown" | "unavailable";
+    checkedAt: number;
+    resetsAt?: number;
+    reason?: "api-key" | "local";
+  };
+}> {
+  return request(`/api/local/automation?projectId=${encodeURIComponent(projectId)}`, { signal });
+}
+
+export async function saveLocalAutomation(input: {
+  projectId: string;
+  enabledByUser: boolean;
+  intervalMinutes: number;
+  provider?: string | null;
+  model: string;
+  reasoningEffort: string;
+}): Promise<{
+  item?: {
+    id: string;
+    status: "ACTIVE" | "PAUSED";
+    provider?: string | null;
+    model: string;
+    reasoningEffort: string;
+    rrule: string;
+    nextRunAt?: number | null;
+  };
+  policy?: {
+    automationId?: string;
+    enabledByUser: boolean;
+    quotaAware: boolean;
+    intervalMinutes: number;
+    provider?: string | null;
+    model: string;
+    reasoningEffort: string;
+  };
+  quota?: {
+    state: "available" | "blocked" | "unknown" | "unavailable";
+    checkedAt: number;
+    resetsAt?: number;
+    reason?: "api-key" | "local";
+  };
+}> {
+  return request("/api/local/automation", {
+    method: "PUT",
+    body: JSON.stringify(input),
+  });
+}
+
+export async function setProjectWorkspace(
+  projectId: string,
+  workspacePath: string,
+): Promise<Project> {
+  const data = await request<{ project: Project }>(
+    `/api/projects/${encodeURIComponent(projectId)}/workspace`,
+    {
+      method: "PUT",
+      body: JSON.stringify({ workspacePath }),
+    },
+  );
+  return data.project;
 }
 
 export async function listDeviceWorkspaces(signal?: AbortSignal): Promise<Record<string, string>> {

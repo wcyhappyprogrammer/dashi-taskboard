@@ -25,6 +25,7 @@ const styles = await readFile(new URL("../web/src/styles.css", import.meta.url),
 
 const models = [
   {
+    provider: "codex",
     slug: "codex-real-model",
     displayName: "Codex Real Model",
     description: "Host model",
@@ -33,6 +34,7 @@ const models = [
     serviceTiers: [{ id: "priority", name: "Priority" }],
   },
   {
+    provider: "codex",
     slug: "codex-fast-model",
     displayName: "Codex Fast Model",
     description: "Fast host model",

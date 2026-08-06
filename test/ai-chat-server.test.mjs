@@ -45,6 +45,7 @@ if (args[0] === "debug") {
     codexExecutable,
     codexStatePath,
     skillPath: "/fixture/manage-taskboard/SKILL.md",
+    providerIds: ["codex"],
   });
   const address = await app.listen({ host, port: 0 });
   return {
@@ -132,16 +133,17 @@ test("loopback AI API freezes server-owned origin and rejects injected execution
     assert.equal(created.body.thread.origin.workspacePath, fixture.workspace);
     const threadId = created.body.thread.id;
 
+    const skillMarker = "\uFFFC";
     const invalidSkill = await request(fixture.baseUrl, `/api/local/ai/threads/${threadId}/turns`, {
       method: "POST",
-      body: { message: "hello", skillIds: ["invented-skill"] },
+      body: { message: `hello ${skillMarker}`, skillIds: ["invented-skill"] },
     });
     assert.equal(invalidSkill.response.status, 400);
     assert.equal(invalidSkill.body.error.code, "INVALID_SKILL");
 
     const turn = await request(fixture.baseUrl, `/api/local/ai/threads/${threadId}/turns`, {
       method: "POST",
-      body: { message: "hello", skillIds: ["real-skill"] },
+      body: { message: `hello ${skillMarker}`, skillIds: ["real-skill"] },
     });
     assert.equal(turn.response.status, 202);
     assert.equal(turn.body.run.threadId, threadId);

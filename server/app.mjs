@@ -17,6 +17,13 @@ import {
 } from "../shared/domain.mjs";
 import { normalizeWorkflowSnapshot } from "../shared/workflow-control-flow.mjs";
 import { AiChatService } from "./ai-chat.mjs";
+import { loadDeviceWorkspaces } from "./ai-chat-catalog.mjs";
+import { createAiProviderConfigStore, PROVIDER_IDS } from "./ai-provider-config.mjs";
+import { createLocalAutomationService } from "./local-automation.mjs";
+import { createLarkCliService } from "./lark-cli.mjs";
+import { createLarkNotifier } from "./lark-notifier.mjs";
+import { createLarkTaskSync } from "./lark-task-sync.mjs";
+import { createWorkflowRuntime } from "./workflow-runtime.mjs";
 import { createCloudConfigStore } from "./cloud-config.mjs";
 import {
   CloudProxyError,
@@ -790,12 +797,85 @@ function parseAiSetting(value, name, maxLength) {
   return setting;
 }
 
+function parseAiProvider(value) {
+  if (value === undefined) return undefined;
+  if (!PROVIDER_IDS.includes(value)) {
+    throw new ApiError(
+      400,
+      "INVALID_PROVIDER",
+      `'provider' must be one of: ${PROVIDER_IDS.join(", ")}`,
+    );
+  }
+  return value;
+}
+
+function parseAiProviderConfigScope(value) {
+  if (value !== "global" && value !== "project") {
+    throw new ApiError(400, "INVALID_SCOPE", "'scope' must be global or project");
+  }
+  return value;
+}
+
+function parseAiProviderConfigSave(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set([
+    "scope",
+    "projectId",
+    "provider",
+    "patch",
+    "apiKey",
+    "clearApiKey",
+  ]));
+  const scope = parseAiProviderConfigScope(body.scope);
+  const provider = parseAiProvider(body.provider);
+  if (provider === undefined) {
+    throw new ApiError(400, "INVALID_PROVIDER", "'provider' is required");
+  }
+  if (body.clearApiKey !== undefined && typeof body.clearApiKey !== "boolean") {
+    throw new ApiError(400, "INVALID_FIELD", "'clearApiKey' must be a boolean");
+  }
+  if (body.apiKey !== undefined && body.apiKey !== null && typeof body.apiKey !== "string") {
+    throw new ApiError(400, "INVALID_FIELD", "'apiKey' must be a string");
+  }
+  return {
+    scope,
+    projectId: scope === "project"
+      ? validateProjectId(body.projectId)
+      : undefined,
+    provider,
+    patch: body.patch === undefined ? {} : body.patch,
+    apiKey: body.apiKey,
+    clearApiKey: body.clearApiKey === true,
+  };
+}
+
+function parseAiProviderTest(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set([
+    "provider",
+    "projectId",
+    "draft",
+  ]));
+  const provider = parseAiProvider(body.provider);
+  if (provider === undefined) {
+    throw new ApiError(400, "INVALID_PROVIDER", "'provider' is required");
+  }
+  return {
+    providerId: provider,
+    projectId: body.projectId === undefined || body.projectId === null
+      ? null
+      : validateProjectId(body.projectId),
+    draft: body.draft === undefined ? {} : body.draft,
+  };
+}
+
 function parseAiThreadCreate(body) {
   assertPlainObject(body);
   assertAllowedKeys(body, new Set([
     "projectId",
     "issueId",
     "title",
+    "provider",
     "model",
     "reasoningEffort",
     "sandbox",
@@ -804,6 +884,7 @@ function parseAiThreadCreate(body) {
     projectId: validateProjectId(body.projectId),
     issueId: parseAiSetting(body.issueId, "issueId", 128),
     title: parseAiSetting(body.title, "title", 160),
+    provider: parseAiProvider(body.provider),
     model: parseAiSetting(body.model, "model", 128),
     reasoningEffort: parseAiSetting(body.reasoningEffort, "reasoningEffort", 64),
     sandbox: parseAiSandbox(body.sandbox),
@@ -812,9 +893,10 @@ function parseAiThreadCreate(body) {
 
 function parseAiThreadPatch(body) {
   assertPlainObject(body);
-  assertAllowedKeys(body, new Set(["title", "model", "reasoningEffort", "sandbox"]));
+  assertAllowedKeys(body, new Set(["title", "provider", "model", "reasoningEffort", "sandbox"]));
   const input = {};
   if (body.title !== undefined) input.title = parseAiSetting(body.title, "title", 160);
+  if (body.provider !== undefined) input.provider = parseAiProvider(body.provider);
   if (body.model !== undefined) input.model = parseAiSetting(body.model, "model", 128);
   if (body.reasoningEffort !== undefined) {
     input.reasoningEffort = parseAiSetting(body.reasoningEffort, "reasoningEffort", 64);
@@ -930,6 +1012,7 @@ function parseAiTurn(body) {
 class EventHub {
   constructor() {
     this.clients = new Set();
+    this.localListeners = new Set();
     this.keepAlive = setInterval(() => {
       for (const response of this.clients) response.write(": keep-alive\n\n");
     }, 20_000);
@@ -948,6 +1031,12 @@ class EventHub {
     request.once("close", () => this.clients.delete(response));
   }
 
+  onLocal(listener) {
+    if (typeof listener !== "function") return () => {};
+    this.localListeners.add(listener);
+    return () => this.localListeners.delete(listener);
+  }
+
   emit(type, value) {
     const event = {
       type,
@@ -956,12 +1045,20 @@ class EventHub {
       ...value,
       at: new Date().toISOString(),
     };
+    for (const listener of this.localListeners) {
+      try {
+        listener(type, event);
+      } catch {
+        // Local side-effects must not break SSE fan-out.
+      }
+    }
     const message = `event: ${type}\ndata: ${JSON.stringify(event)}\n\n`;
     for (const response of this.clients) response.write(message);
   }
 
   close() {
     clearInterval(this.keepAlive);
+    this.localListeners.clear();
     for (const response of this.clients) response.end();
     this.clients.clear();
   }
@@ -1279,9 +1376,21 @@ export function resolveServerOptions(options = {}) {
     databasePath: options.databasePath ?? path.join(dataDirectory, "taskboard.sqlite"),
     attachmentsDirectory: options.attachmentsDirectory ?? path.join(dataDirectory, "attachments"),
     cloudConfigPath: options.cloudConfigPath ?? path.join(dataDirectory, "cloud-companion.json"),
+    aiProviderConfigPath: options.aiProviderConfigPath
+      ?? path.join(dataDirectory, "ai-providers.json"),
+    localAutomationPath: options.localAutomationPath
+      ?? path.join(dataDirectory, "local-automations.json"),
+    larkCliConfigPath: options.larkCliConfigPath
+      ?? path.join(dataDirectory, "lark-cli.json"),
     staticDirectory: options.staticDirectory ?? path.join(PROJECT_ROOT, "dist", "web"),
     skillPath: options.skillPath ?? path.join(PROJECT_ROOT, "skills", "manage-taskboard", "SKILL.md"),
     codexExecutable: options.codexExecutable ?? process.env.CODEX_EXECUTABLE ?? "codex",
+    claudeExecutable: options.claudeExecutable ?? process.env.CLAUDE_EXECUTABLE ?? "claude",
+    providerIds: options.providerIds ?? (
+      typeof process.env.AI_PROVIDERS === "string" && process.env.AI_PROVIDERS.trim()
+        ? process.env.AI_PROVIDERS.split(",").map((value) => value.trim()).filter(Boolean)
+        : undefined
+    ),
     codexStatePath: options.codexStatePath
       ?? path.join(codexHome, ".codex-global-state.json"),
     codexProcessesPath: options.codexProcessesPath
@@ -1326,12 +1435,40 @@ export function createTaskboardServer(options = {}) {
       )) ?? null;
     },
   });
+  const aiProviderConfig = options.aiProviderConfigStore ?? createAiProviderConfigStore({
+    configPath: resolved.aiProviderConfigPath,
+  });
+  const larkCli = options.larkCliService ?? createLarkCliService({
+    configPath: resolved.larkCliConfigPath,
+  });
   const aiChat = new AiChatService({
     database,
     codexExecutable: resolved.codexExecutable,
+    claudeExecutable: resolved.claudeExecutable,
     codexStatePath: resolved.codexStatePath,
     manageTaskboardSkillPath: resolved.skillPath,
+    providerIds: resolved.providerIds,
+    configStore: aiProviderConfig,
+    larkCli,
   });
+  const localAutomation = options.localAutomationService ?? createLocalAutomationService({
+    database,
+    aiChat,
+    skillPath: resolved.skillPath,
+    configPath: resolved.localAutomationPath,
+  });
+  const larkNotifier = options.larkNotifier ?? createLarkNotifier({ lark: larkCli });
+  const larkTaskSync = options.larkTaskSync ?? createLarkTaskSync({
+    lark: larkCli,
+    database,
+    events,
+  });
+  const workflowRuntime = options.workflowRuntime ?? createWorkflowRuntime({
+    lark: larkCli,
+    database,
+  });
+  larkNotifier.attach(events);
+  larkTaskSync.attach(events);
   const aiEventResponses = new Set();
 
   const server = createServer(async (request, response) => {
@@ -1424,6 +1561,9 @@ export function createTaskboardServer(options = {}) {
           throw new ApiError(400, "INVALID_FIELD", "'workspacePath' must be absolute");
         }
         await cloudConfig.setProjectWorkspace(projectId, workspacePath);
+        if (database.getProject(projectId)) {
+          database.setProjectWorkspace(projectId, workspacePath);
+        }
         return sendJson(response, 200, { projectId, workspacePath });
       }
 
@@ -1443,6 +1583,205 @@ export function createTaskboardServer(options = {}) {
             }
             : {}),
         });
+      }
+
+      if (pathname === "/api/local/automation") {
+        assertLoopbackRequest(request);
+        if (request.method === "GET") {
+          assertAllowedQuery(
+            url.searchParams,
+            new Set(["projectId"]),
+            "GET /api/local/automation",
+          );
+          const projectId = validateProjectId(url.searchParams.get("projectId") ?? undefined);
+          return sendJson(response, 200, await localAutomation.getState(projectId));
+        }
+        if (request.method === "PUT") {
+          assertNoQuery(url.searchParams, "PUT /api/local/automation");
+          const body = await readJson(request);
+          if (!body || typeof body !== "object" || Array.isArray(body)) {
+            throw new ApiError(400, "INVALID_BODY", "Expected a JSON object");
+          }
+          const projectId = validateProjectId(body.projectId);
+          if (typeof body.enabledByUser !== "boolean") {
+            throw new ApiError(400, "INVALID_FIELD", "'enabledByUser' must be a boolean");
+          }
+          const intervalMinutes = Number(body.intervalMinutes);
+          if (!Number.isInteger(intervalMinutes) || intervalMinutes < 1 || intervalMinutes > 180) {
+            throw new ApiError(400, "INVALID_FIELD", "'intervalMinutes' must be an integer from 1 to 180");
+          }
+          if (typeof body.model !== "string" || !body.model.trim()) {
+            throw new ApiError(400, "INVALID_FIELD", "'model' is required");
+          }
+          if (typeof body.reasoningEffort !== "string" || !body.reasoningEffort.trim()) {
+            throw new ApiError(400, "INVALID_FIELD", "'reasoningEffort' is required");
+          }
+          const provider = body.provider === undefined || body.provider === null
+            ? null
+            : body.provider;
+          if (provider != null && !PROVIDER_IDS.includes(provider)) {
+            throw new ApiError(400, "INVALID_FIELD", "'provider' is invalid");
+          }
+          return sendJson(response, 200, await localAutomation.applyPolicy({
+            projectId,
+            enabledByUser: body.enabledByUser,
+            intervalMinutes,
+            provider,
+            model: body.model.trim(),
+            reasoningEffort: body.reasoningEffort.trim(),
+          }));
+        }
+        return methodNotAllowed(response, ["GET", "PUT"]);
+      }
+
+      if (pathname === "/api/local/lark/config") {
+        if (request.method === "GET") {
+          assertNoQuery(url.searchParams, "GET /api/local/lark/config");
+          return sendJson(response, 200, {
+            config: await larkCli.getConfig(),
+            availability: await larkCli.getAiAvailability(),
+          });
+        }
+        if (request.method === "PUT") {
+          assertNoQuery(url.searchParams, "PUT /api/local/lark/config");
+          const body = await readJson(request);
+          if (!body || typeof body !== "object" || Array.isArray(body)) {
+            throw new ApiError(400, "INVALID_BODY", "Body must be an object");
+          }
+          return sendJson(response, 200, {
+            config: await larkCli.saveConfig(body),
+            availability: await larkCli.getAiAvailability(),
+          });
+        }
+        return methodNotAllowed(response, ["GET", "PUT"]);
+      }
+
+      if (pathname === "/api/local/lark/test") {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/local/lark/test");
+        const body = await readJson(request);
+        return sendJson(response, 200, await larkCli.testConnection(
+          body && typeof body === "object" ? body : {},
+        ));
+      }
+
+      if (pathname === "/api/local/lark/chats") {
+        if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+        assertAllowedQuery(url.searchParams, new Set(["query", "as"]), "GET /api/local/lark/chats");
+        const query = url.searchParams.get("query") ?? "";
+        const as = url.searchParams.get("as");
+        return sendJson(response, 200, await larkCli.listChats({
+          query,
+          as: as === "bot" || as === "user" ? as : undefined,
+        }));
+      }
+
+      if (pathname === "/api/local/lark/skills/install") {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/local/lark/skills/install");
+        return sendJson(response, 200, await larkCli.installSkills());
+      }
+
+      if (pathname === "/api/local/lark/sync") {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/local/lark/sync");
+        return sendJson(response, 200, await larkTaskSync.runSync());
+      }
+
+      if (pathname === "/api/local/workflow/run") {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/local/workflow/run");
+        const body = await readJson(request);
+        if (!body || typeof body !== "object" || Array.isArray(body)) {
+          throw new ApiError(400, "INVALID_BODY", "Body must be an object");
+        }
+        if (body.data && typeof body.data === "object") {
+          return sendJson(response, 200, await workflowRuntime.runNodeData({
+            data: body.data,
+            inputText: typeof body.inputText === "string" ? body.inputText : undefined,
+          }));
+        }
+        const projectId = validateProjectId(body.projectId);
+        const nodeId = typeof body.nodeId === "string" ? body.nodeId.trim() : "";
+        if (!nodeId) {
+          throw new ApiError(400, "INVALID_FIELD", "'nodeId' is required");
+        }
+        return sendJson(response, 200, await workflowRuntime.runNode({
+          projectId,
+          nodeId,
+          inputText: typeof body.inputText === "string" ? body.inputText : undefined,
+        }));
+      }
+
+      if (pathname === "/api/local/ai-providers/config") {
+        if (request.method === "GET") {
+          assertAllowedQuery(
+            url.searchParams,
+            new Set(["projectId"]),
+            "GET /api/local/ai-providers/config",
+          );
+          const projectId = url.searchParams.get("projectId");
+          return sendJson(
+            response,
+            200,
+            await aiProviderConfig.getPublicConfig(
+              projectId ? validateProjectId(projectId) : null,
+            ),
+          );
+        }
+        if (request.method === "PUT") {
+          assertNoQuery(url.searchParams, "PUT /api/local/ai-providers/config");
+          const input = parseAiProviderConfigSave(await readJson(request));
+          const config = await aiProviderConfig.saveProviderConfig(input);
+          return sendJson(response, 200, config);
+        }
+        if (request.method === "DELETE") {
+          assertAllowedQuery(
+            url.searchParams,
+            new Set(["scope", "projectId", "provider"]),
+            "DELETE /api/local/ai-providers/config",
+          );
+          const scope = parseAiProviderConfigScope(url.searchParams.get("scope"));
+          const provider = parseAiProvider(url.searchParams.get("provider"));
+          if (provider === undefined) {
+            throw new ApiError(400, "INVALID_PROVIDER", "'provider' is required");
+          }
+          const projectId = scope === "project"
+            ? validateProjectId(url.searchParams.get("projectId") ?? undefined)
+            : null;
+          const config = await aiProviderConfig.deleteProviderConfig({
+            scope,
+            projectId,
+            provider,
+          });
+          return sendJson(response, 200, config);
+        }
+        return methodNotAllowed(response, ["GET", "PUT", "DELETE"]);
+      }
+
+      if (pathname === "/api/local/ai-providers/test") {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/local/ai-providers/test");
+        const input = parseAiProviderTest(await readJson(request));
+        const result = await aiChat.providers.testProvider({
+          providerId: input.providerId,
+          projectId: input.projectId,
+          draft: input.draft,
+          database,
+        });
+        return sendJson(response, 200, result);
+      }
+
+      if (pathname === "/api/local/ai-providers/login") {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/local/ai-providers/login");
+        const input = parseAiProviderTest(await readJson(request));
+        const result = await aiChat.providers.startLogin({
+          providerId: input.providerId,
+          projectId: input.projectId,
+          draft: input.draft,
+        });
+        return sendJson(response, 200, result);
       }
 
       if (pathname === "/api/local/ai/catalog") {
@@ -1543,9 +1882,34 @@ export function createTaskboardServer(options = {}) {
         if ([...url.searchParams.keys()].length > 0) {
           throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "GET /api/device-workspaces does not accept query parameters");
         }
-        return sendJson(response, 200, {
-          workspaces: await readCodexProjectWorkspaces(resolved.codexStatePath),
-        });
+        const cloudMappings = (await cloudConfig.read()).projectMappings ?? {};
+        const workspaces = Object.fromEntries(
+          await loadDeviceWorkspaces(resolved.codexStatePath, database, cloudMappings),
+        );
+        return sendJson(response, 200, { workspaces });
+      }
+
+      const projectWorkspaceRoute = pathname.match(/^\/api\/projects\/([^/]+)\/workspace$/);
+      if (projectWorkspaceRoute) {
+        if (request.method !== "PUT") return methodNotAllowed(response, ["PUT"]);
+        assertNoQuery(url.searchParams, "PUT /api/projects/:id/workspace");
+        let projectId;
+        try {
+          projectId = decodeURIComponent(projectWorkspaceRoute[1]);
+        } catch {
+          throw new ApiError(400, "INVALID_PATH", "Project id contains invalid encoding");
+        }
+        validateProjectId(projectId);
+        const body = await readJson(request);
+        assertPlainObject(body);
+        assertAllowedKeys(body, new Set(["workspacePath"]));
+        const workspacePath = pathField(body.workspacePath, "workspacePath");
+        if (!workspacePath || !path.isAbsolute(workspacePath)) {
+          throw new ApiError(400, "INVALID_FIELD", "'workspacePath' must be absolute");
+        }
+        const project = database.setProjectWorkspace(projectId, workspacePath);
+        await cloudConfig.setProjectWorkspace(projectId, workspacePath);
+        return sendJson(response, 200, { project });
       }
 
       if (pathname === "/api/workflow-capabilities") {
@@ -2067,9 +2431,12 @@ export function createTaskboardServer(options = {}) {
         server.listen(port, host);
       });
       listening = true;
+      await localAutomation.start();
       return server.address();
     },
     async close() {
+      localAutomation.stop();
+      larkTaskSync.stop();
       const serverClosed = listening
         ? new Promise((resolve, reject) => {
             server.close((error) => error ? reject(error) : resolve());

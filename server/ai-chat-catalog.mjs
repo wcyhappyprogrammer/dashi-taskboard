@@ -19,7 +19,7 @@ async function existingDirectory(value) {
   }
 }
 
-export async function loadDeviceWorkspaces(codexStatePath, database) {
+export async function loadDeviceWorkspaces(codexStatePath, database, extraMappings = {}) {
   const workspaces = new Map();
   let localProjects = {};
   try {
@@ -47,6 +47,14 @@ export async function loadDeviceWorkspaces(codexStatePath, database) {
     if (workspaces.has(project.id)) continue;
     const workspacePath = await existingDirectory(project.workspacePath);
     if (workspacePath) workspaces.set(project.id, workspacePath);
+  }
+
+  if (extraMappings && typeof extraMappings === "object") {
+    for (const [projectId, mappedPath] of Object.entries(extraMappings)) {
+      if (workspaces.has(projectId)) continue;
+      const workspacePath = await existingDirectory(mappedPath);
+      if (workspacePath) workspaces.set(projectId, workspacePath);
+    }
   }
   return workspaces;
 }

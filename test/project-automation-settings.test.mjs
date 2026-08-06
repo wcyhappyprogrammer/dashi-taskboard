@@ -22,7 +22,8 @@ test("project automation state is device-local and scoped by taskboard project",
   assert.match(appSource, /type ProjectAutomationStatus = "ACTIVE" \| "PAUSED"/);
   assert.match(appSource, /automationId\?: string/);
   assert.match(appSource, /codexProjectId: string/);
-  assert.match(appSource, /type AutomationIntervalMinutes = 5 \| 10 \| 15 \| 30 \| 60/);
+  assert.match(appSource, /type AutomationIntervalMinutes = number/);
+  assert.match(appSource, /provider\?: AiChatProviderId/);
   assert.match(appSource, /DEFAULT_AUTOMATION_OPTIONS[\s\S]*?model: "gpt-5\.5"[\s\S]*?reasoningEffort: "high"/);
   assert.match(appSource, /localStorage\.getItem\(PROJECT_AUTOMATIONS_KEY\)/);
   assert.match(appSource, /localStorage\.setItem\(PROJECT_AUTOMATIONS_KEY, JSON\.stringify\(next\)\)/);
@@ -50,6 +51,10 @@ test("project mapping is based on exact ids and workspace paths, never project n
   assert.match(appSource, /hostContext\?\.projects\?\.some\([\s\S]*?project\.id === selectedProject\.id/);
   assert.match(appSource, /deviceWorkspacePaths\[project\.id\] === workspacePath/);
   assert.match(appSource, /请先在 Codex 中添加并映射该项目目录/);
+  assert.match(appSource, /请先为项目配置本机工作区目录/);
+  assert.match(appSource, /mode: "local"/);
+  assert.match(appSource, /saveLocalAutomation/);
+  assert.doesNotMatch(appSource, /仅可在 Codex App 中使用/);
   assert.doesNotMatch(appSource, /project\.name === selectedProject\.name/);
 });
 
@@ -62,9 +67,10 @@ test("the project navigation automation menu owns the icon, fields, and accessib
   assert.match(menuSource, /无自动化/);
   assert.doesNotMatch(menuSource, /已开启自动认领|自动认领未开启/);
   assert.match(menuSource, /自动认领开关/);
-  assert.match(menuSource, /5, 10, 15, 30, 60/);
+  assert.match(menuSource, /INTERVAL_PRESETS/);
+  assert.match(menuSource, /AI Provider/);
   assert.match(menuSource, /AUTOMATION_MODELS\.map/);
-  assert.match(menuSource, /EFFORT_LABELS\[effort\]/);
+  assert.match(menuSource, /effortLabel\(effort\)/);
   assert.match(menuSource, /createPortal/);
   assert.match(menuSource, /window\.addEventListener\("resize"/);
   assert.match(menuSource, /window\.addEventListener\("scroll", closeFromViewportChange, true\)/);
@@ -96,18 +102,18 @@ test("automation play and pause retain Linear's 16px filled presentation", () =>
 });
 
 test("the automation menu reuses the Linear switch and keeps form focus chrome suppressed", () => {
-  assert.match(menuSource, /className=\{`board-setting-switch\$\{draft\.status === "ACTIVE" \? " is-on" : ""\}`\}/);
+  assert.match(menuSource, /className=\{`board-setting-switch\$\{draft\.enabledByUser \? " is-on" : ""\}`\}/);
   assert.match(menuSource, /role="switch"/);
-  assert.match(menuSource, /aria-checked=\{draft\.status === "ACTIVE"\}/);
+  assert.match(menuSource, /aria-checked=\{draft\.enabledByUser\}/);
   assert.doesNotMatch(menuSource, /type="checkbox"/);
-  assert.match(styles, /\.project-automation-field select:focus-visible\s*\{[^}]*outline:\s*0;[^}]*box-shadow:\s*none;/s);
+  assert.match(styles, /\.project-automation-field select:focus-visible,\s*\.project-automation-field input\[type="text"\]:focus-visible,\s*\.project-automation-field input\[type="number"\]:focus-visible\s*\{[^}]*outline:\s*0;[^}]*box-shadow:\s*none;/s);
   assert.doesNotMatch(styles, /\.project-automation-switch input:focus-visible/);
 });
 
 test("unavailable automation state has one notice, clears stale errors, and cannot change", () => {
   assert.match(menuSource, /error && error !== unavailableReason/);
   assert.match(menuSource, /const disabled = pending \|\| Boolean\(unavailableReason\)/);
-  assert.equal(menuSource.match(/disabled=\{disabled\}/g)?.length, 4);
+  assert.equal(menuSource.match(/disabled=\{disabled\}/g)?.length, 5);
   const reconcileSource = appSource.slice(
     appSource.indexOf("const reconcileProjectAutomation"),
     appSource.indexOf("const saveProjectAutomation"),
@@ -122,10 +128,11 @@ test("unavailable automation state has one notice, clears stale errors, and cann
 test("automation changes submit immediately with model-specific effort normalization", () => {
   assert.match(menuSource, /onChange: \(options: AutomationOptions\) => void/);
   assert.match(menuSource, /const disabled = pending \|\| Boolean\(unavailableReason\)/);
-  assert.match(menuSource, /const submitChange = \(next: AutomationOptions\) => \{[\s\S]*?setDraft\(next\);[\s\S]*?onChange\(next\);[\s\S]*?\}/);
-  assert.match(menuSource, /submitChange\(withAutomationModel\(draft, event\.target\.value as AutomationModel\)\)/);
-  assert.match(menuSource, /getAutomationModel\(draft\.model\)\.efforts\.map/);
-  assert.match(menuSource, /<option key=\{effort\} value=\{effort\}>\{EFFORT_LABELS\[effort\]\}<\/option>/);
+  assert.match(menuSource, /const submitChange = \(next: AutomationOptions\) => \{[\s\S]*?setDraft\(normalized\);[\s\S]*?onChange\(normalized\);[\s\S]*?\}/);
+  assert.match(menuSource, /chooseModel\(/);
+  assert.match(menuSource, /chooseProvider\(/);
+  assert.match(menuSource, /effortOptions\.map/);
+  assert.match(menuSource, /<option key=\{effort\} value=\{effort\}>\{effortLabel\(effort\)\}<\/option>/);
   assert.match(menuSource, /low: "轻度"/);
   assert.match(menuSource, /xhigh: "极高 \(xhigh\)"/);
   assert.match(menuSource, /max: "最高"/);
@@ -133,7 +140,7 @@ test("automation changes submit immediately with model-specific effort normaliza
   assert.doesNotMatch(menuSource, />取消</);
   assert.doesNotMatch(menuSource, />保存</);
   assert.doesNotMatch(menuSource, /project-automation-actions/);
-  assert.doesNotMatch(menuSource, /onSave/);
+  assert.match(menuSource, /onSaveWorkspace/);
   assert.doesNotMatch(styles, /\.project-automation-actions/);
 });
 
@@ -141,18 +148,18 @@ test("pending completion reconciles the optimistic draft to confirmed host state
   assert.match(menuSource, /const wasPendingRef = useRef\(pending\)/);
   assert.match(
     menuSource,
-    /if \(wasPendingRef\.current && !pending\) \{\s*setDraft\(\{ \.\.\.DEFAULT_OPTIONS, \.\.\.automation \}\);\s*\}/,
+    /if \(wasPendingRef\.current && !pending\) \{\s*const next = normalizeLocalOptions\(\{ \.\.\.DEFAULT_OPTIONS, \.\.\.automation \}\);\s*setDraft\(next\);/,
   );
   assert.match(menuSource, /wasPendingRef\.current = pending/);
   assert.match(menuSource, /disabled=\{disabled\}/);
 });
 
 test("opening settings and changing projects reconcile with the host list", () => {
-  assert.match(appSource, /sendAutomationRequest\("list", options, stored\?\.automationId\)/);
-  assert.match(appSource, /items\.find\(\(item\) => item\.id === stored\?\.automationId\)/);
+  assert.match(appSource, /stored \? "apply-policy" : "list"/);
+  assert.match(appSource, /getLocalAutomation\(selectedProjectId\)/);
+  assert.match(appSource, /items\.find\(\([\s\S]*?candidate\) => candidate\.id === policy\.automationId\)/);
   assert.match(appSource, /items\.length === 1 \? items\[0\] : undefined/);
   assert.match(appSource, /status: item\.status/);
   assert.match(appSource, /automationId: undefined/);
-  assert.match(appSource, /options\.status === "PAUSED" && !stored\?\.automationId/);
   assert.match(appSource, /writeProjectAutomation\(selectedProjectId, previousRecord\)/);
 });

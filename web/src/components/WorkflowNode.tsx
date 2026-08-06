@@ -64,6 +64,11 @@ export interface WorkflowNodeData extends Record<string, unknown> {
   feishuRecipientType?: "self" | "user" | "chat";
   feishuUserId?: string;
   feishuChatId?: string;
+  feishuMessageText?: string;
+  feishuDocsAction?: "create" | "read";
+  feishuDocTitle?: string;
+  feishuDocContent?: string;
+  feishuDocToken?: string;
   twitterPostContent?: string;
   rssFeedUrl?: string;
   codeRuntime?: "shell" | "javascript" | "python";

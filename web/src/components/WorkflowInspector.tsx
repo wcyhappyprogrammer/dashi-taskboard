@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { runWorkflowNode } from "../api";
 import type { WorkflowCapabilities } from "../types";
 import { LinearIcon } from "./LinearIcon";
 import {
@@ -21,6 +22,7 @@ import { WorkflowMark } from "./WorkflowMark";
 
 interface WorkflowInspectorProps {
   node: WorkflowCanvasNode;
+  projectId: string;
   projectName: string;
   capabilities: WorkflowCapabilities | null;
   capabilitiesFailed: boolean;
@@ -32,6 +34,7 @@ type InspectorTab = "settings" | "configuration";
 
 export function WorkflowInspector({
   node,
+  projectId,
   projectName,
   capabilities,
   capabilitiesFailed,
@@ -39,7 +42,29 @@ export function WorkflowInspector({
   onClose,
 }: WorkflowInspectorProps) {
   const [activeTab, setActiveTab] = useState<InspectorTab>("settings");
+  const [runBusy, setRunBusy] = useState(false);
+  const [runResult, setRunResult] = useState<string | null>(null);
+  const [runError, setRunError] = useState<string | null>(null);
   const data = node.data;
+  const canTryRun = data.kind === "feishu-message" || data.kind === "feishu-docs";
+
+  async function handleTryRun() {
+    setRunBusy(true);
+    setRunResult(null);
+    setRunError(null);
+    try {
+      const result = await runWorkflowNode({
+        projectId,
+        nodeId: node.id,
+        data: data as unknown as Record<string, unknown>,
+      });
+      setRunResult(JSON.stringify(result, null, 2));
+    } catch (error) {
+      setRunError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setRunBusy(false);
+    }
+  }
   const conditionField = data.conditionField ?? CONDITION_FIELDS[0].value;
   const selectedConditionField = CONDITION_FIELDS.find(
     (field) => field.value === conditionField,
@@ -426,6 +451,79 @@ export function WorkflowInspector({
                   />
                 </label>
               )}
+              <label>
+                <span>消息内容</span>
+                <textarea
+                  aria-label="飞书消息内容"
+                  rows={4}
+                  value={data.feishuMessageText ?? ""}
+                  placeholder="输入要发送的内容…"
+                  onChange={(event) => onChange({ feishuMessageText: event.target.value })}
+                />
+              </label>
+            </div>
+          )}
+
+          {data.kind === "feishu-docs" && (
+            <div className="workflow-config-section">
+              <h2>飞书文档</h2>
+              <label>
+                <span>操作</span>
+                <select
+                  aria-label="飞书文档操作"
+                  value={data.feishuDocsAction ?? "create"}
+                  onChange={(event) => onChange({
+                    feishuDocsAction: event.target.value as "create" | "read",
+                  })}
+                >
+                  <option value="create">创建文档</option>
+                  <option value="read">读取文档</option>
+                </select>
+              </label>
+              {(data.feishuDocsAction ?? "create") === "create" ? (
+                <>
+                  <label>
+                    <span>标题</span>
+                    <input
+                      aria-label="飞书文档标题"
+                      type="text"
+                      value={data.feishuDocTitle ?? ""}
+                      onChange={(event) => onChange({ feishuDocTitle: event.target.value })}
+                    />
+                  </label>
+                  <label>
+                    <span>Markdown 内容</span>
+                    <textarea
+                      aria-label="飞书文档内容"
+                      rows={6}
+                      value={data.feishuDocContent ?? ""}
+                      onChange={(event) => onChange({ feishuDocContent: event.target.value })}
+                    />
+                  </label>
+                </>
+              ) : (
+                <label>
+                  <span>文档 Token</span>
+                  <input
+                    aria-label="飞书文档 Token"
+                    type="text"
+                    value={data.feishuDocToken ?? ""}
+                    onChange={(event) => onChange({ feishuDocToken: event.target.value })}
+                  />
+                </label>
+              )}
+            </div>
+          )}
+
+          {canTryRun && (
+            <div className="workflow-config-section">
+              <h2>试运行</h2>
+              <p>通过本机 lark-cli 执行当前节点（需先在「飞书」设置页登录）。</p>
+              <button type="button" disabled={runBusy} onClick={() => void handleTryRun()}>
+                {runBusy ? "执行中…" : "试运行"}
+              </button>
+              {runError && <p className="workflow-inspector-error">{runError}</p>}
+              {runResult && <pre className="workflow-inspector-run-result">{runResult}</pre>}
             </div>
           )}
 

@@ -3,38 +3,22 @@ import os from "node:os";
 import path from "node:path";
 
 import { ApiError } from "./database.mjs";
-import { discoverAiCatalog, resolveAiWorkspace } from "./ai-chat-catalog.mjs";
-import {
-  buildCodexArgs,
-  buildCodexPrompt,
-  normalizeCodexEvent,
-  spawnCodexTurn,
-} from "./ai-chat-process.mjs";
+import { resolveAiWorkspace } from "./ai-chat-catalog.mjs";
+import { createProviderRegistry, SANDBOXES } from "./ai-providers/index.mjs";
+import { signalProcessGroup } from "./ai-providers/shared.mjs";
 
-const SANDBOXES = new Set(["read-only", "workspace-write", "danger-full-access"]);
 const ERROR_CONTENT_LIMIT = 65_536;
-const CODEX_IMAGE_TYPES = new Set([
+const IMAGE_TYPES = new Set([
   "image/gif",
   "image/jpeg",
   "image/png",
   "image/webp",
 ]);
+const SANDBOX_SET = new Set(SANDBOXES);
 
 function cappedError(value) {
   const message = value instanceof Error ? value.message : String(value ?? "");
   return message.slice(0, ERROR_CONTENT_LIMIT);
-}
-
-function signalProcessGroup(child, signal) {
-  if (Number.isInteger(child?.pid)) {
-    try {
-      process.kill(-child.pid, signal);
-      return;
-    } catch {}
-  }
-  try {
-    child?.kill(signal);
-  } catch {}
 }
 
 function wait(milliseconds) {
@@ -51,10 +35,22 @@ export class AiChatService {
     this.codexStatePath = options.codexStatePath;
     this.manageTaskboardSkillPath = options.manageTaskboardSkillPath;
     this.processEnv = options.processEnv ?? process.env;
+    this.configStore = options.configStore ?? null;
+    this.larkCli = options.larkCli ?? null;
     this.killGraceMs = options.killGraceMs ?? 1_000;
     this.active = new Map();
     this.listeners = new Map();
     this.completions = new Map();
+    this.providers = options.providers ?? createProviderRegistry({
+      codexExecutable: options.codexExecutable,
+      claudeExecutable: options.claudeExecutable,
+      codexStatePath: options.codexStatePath,
+      manageTaskboardSkillPath: options.manageTaskboardSkillPath,
+      processEnv: this.processEnv,
+      providerIds: options.providerIds,
+      fetchImpl: options.fetchImpl,
+      configStore: this.configStore,
+    });
   }
 
   listThreads() {
@@ -104,13 +100,23 @@ export class AiChatService {
   }
 
   async getCatalog(projectId) {
-    return discoverAiCatalog({
-      codexExecutable: this.codexExecutable,
-      codexStatePath: this.codexStatePath,
+    const catalog = await this.providers.getCatalog({
       database: this.database,
       projectId,
       processEnv: this.processEnv,
     });
+    if (!this.larkCli) return catalog;
+    try {
+      catalog.lark = await this.larkCli.getAiAvailability();
+    } catch (error) {
+      catalog.lark = {
+        available: false,
+        installed: false,
+        loggedIn: false,
+        detail: error instanceof Error ? error.message : String(error),
+      };
+    }
+    return catalog;
   }
 
   async createThread(input) {
@@ -118,10 +124,19 @@ export class AiChatService {
       this.getCatalog(input.projectId),
       resolveAiWorkspace(input.projectId, this.codexStatePath, this.database),
     ]);
-    const model = this.#resolveModel(catalog, input.model);
-    const reasoningEffort = input.reasoningEffort ?? model.defaultReasoningEffort;
+    const defaults = catalog.defaults ?? {};
+    const preferredProvider = input.provider
+      ?? catalog.providers.find((entry) => entry.available)?.id;
+    const provider = this.#resolveProvider(catalog, preferredProvider);
+    const preferredModel = input.model ?? defaults[provider.id]?.model;
+    const model = this.#resolveModel(catalog, preferredModel, provider.id);
+    const reasoningEffort = input.reasoningEffort
+      ?? defaults[provider.id]?.reasoningEffort
+      ?? model.defaultReasoningEffort;
     this.#validateReasoningEffort(model, reasoningEffort);
-    const sandbox = input.sandbox ?? "workspace-write";
+    const sandbox = provider.supportsSandbox === false
+      ? (input.sandbox ?? "workspace-write")
+      : (input.sandbox ?? defaults[provider.id]?.sandbox ?? "workspace-write");
     this.#validateSandbox(sandbox);
 
     let issue;
@@ -144,6 +159,7 @@ export class AiChatService {
         workspacePath: resolved.workspacePath,
         ...(issue ? { issueId: issue.id, issueIdentifier: issue.identifier } : {}),
       },
+      provider: provider.id,
       model: model.slug,
       reasoningEffort,
       sandbox,
@@ -152,18 +168,34 @@ export class AiChatService {
 
   async updateThread(threadId, changes) {
     let thread = this.getThread(threadId);
-    const changesSettings = ["model", "reasoningEffort", "sandbox"].some(
+    const changesSettings = ["provider", "model", "reasoningEffort", "sandbox"].some(
       (key) => Object.hasOwn(changes, key),
     );
     const wasActive = changesSettings && this.#threadIsActive(thread);
 
     if (Object.hasOwn(changes, "sandbox")) this.#validateSandbox(changes.sandbox);
-    if (Object.hasOwn(changes, "model") || Object.hasOwn(changes, "reasoningEffort")) {
+    if (
+      Object.hasOwn(changes, "provider")
+      || Object.hasOwn(changes, "model")
+      || Object.hasOwn(changes, "reasoningEffort")
+    ) {
       const catalog = await this.getCatalog(thread.origin.projectId);
       thread = this.getThread(threadId);
-      const model = this.#resolveModel(catalog, changes.model ?? thread.model);
+      const provider = this.#resolveProvider(catalog, changes.provider ?? thread.provider);
+      const model = this.#resolveModel(catalog, changes.model ?? thread.model, provider.id);
       const reasoningEffort = changes.reasoningEffort ?? thread.reasoningEffort;
       this.#validateReasoningEffort(model, reasoningEffort);
+      if (Object.hasOwn(changes, "provider") && changes.provider !== thread.provider) {
+        changes = {
+          ...changes,
+          provider: provider.id,
+          providerSessionId: null,
+          model: Object.hasOwn(changes, "model") ? changes.model : model.slug,
+          reasoningEffort: Object.hasOwn(changes, "reasoningEffort")
+            ? changes.reasoningEffort
+            : model.defaultReasoningEffort,
+        };
+      }
     }
     if (wasActive || (changesSettings && this.#threadIsActive(thread))) {
       throw new ApiError(
@@ -226,7 +258,8 @@ export class AiChatService {
         "danger-full-access must be confirmed for every turn",
       );
     }
-    const model = this.#resolveModel(catalog, thread.model);
+    const provider = this.#resolveProvider(catalog, thread.provider);
+    const model = this.#resolveModel(catalog, thread.model, provider.id);
     this.#validateReasoningEffort(model, thread.reasoningEffort);
     if (resolved.workspacePath !== thread.origin.workspacePath) {
       throw new ApiError(
@@ -237,9 +270,19 @@ export class AiChatService {
     }
 
     const skillIds = input.skillIds ?? [];
+    if (skillIds.length > 0 && provider.supportsSkills === false) {
+      throw new ApiError(
+        400,
+        "INVALID_SKILL",
+        `Provider '${provider.id}' does not support skills`,
+      );
+    }
     const availableSkills = new Map(
       catalog.skills
-        .filter((skill) => skill.id !== "manage-taskboard")
+        .filter((skill) => (
+          skill.id !== "manage-taskboard"
+          && (skill.provider ?? "codex") === provider.id
+        ))
         .map((skill) => [skill.id, skill]),
     );
     for (const skillId of skillIds) {
@@ -256,16 +299,6 @@ export class AiChatService {
       imagePaths,
     } = await this.#writeTurnAttachments(attachments);
     try {
-      const args = buildCodexArgs(thread, resolved.addDirectories, imagePaths);
-      const prompt = buildCodexPrompt(
-        thread,
-        {
-          message: input.message,
-          skills: selectedSkills,
-          attachmentPaths,
-        },
-        this.manageTaskboardSkillPath,
-      );
       const run = this.database.createAiChatRun({ threadId });
       this.#emit(threadId, { type: "ai.run", run });
       const userEventData = {};
@@ -287,29 +320,48 @@ export class AiChatService {
       });
       this.#emit(threadId, { type: "ai.event", event: userEvent });
 
-      const resumingThreadId = thread.codexThreadId;
-      let startedThreadId = null;
-      let terminalOutcome = null;
-      let terminalError = "";
-      const { child, completion } = spawnCodexTurn({
-        executable: this.codexExecutable,
-        args,
-        prompt,
-        env: this.processEnv,
-        onRawEvent: (raw) => {
-          const normalized = normalizeCodexEvent(raw);
-          if (!normalized) return;
-          if (normalized.kind === "thread.started") {
-            if (
-              (resumingThreadId && normalized.threadId !== resumingThreadId)
-              || (startedThreadId && normalized.threadId !== startedThreadId)
-            ) {
-              throw new Error("Codex returned an unexpected thread id");
-            }
-            startedThreadId = normalized.threadId;
-            this.database.updateAiChatThread(threadId, { codexThreadId: normalized.threadId });
+      const historyEvents = this.database.listAiChatEvents(threadId);
+      const providerConfig = await this.providers.resolveProviderConfig(
+        provider.id,
+        thread.origin.projectId,
+      );
+      if (providerConfig.enabled === false) {
+        throw new ApiError(
+          400,
+          "INVALID_PROVIDER",
+          `Provider '${provider.id}' is disabled in AI provider settings`,
+        );
+      }
+      let processEnv = this.processEnv;
+      let larkAvailable = false;
+      if (this.larkCli) {
+        try {
+          processEnv = await this.larkCli.ensureLarkOnPath(this.processEnv);
+          const availability = await this.larkCli.getAiAvailability();
+          larkAvailable = availability.available === true;
+        } catch {
+          processEnv = this.processEnv;
+        }
+      }
+      const handle = await provider.startTurn({
+        thread,
+        addDirectories: resolved.addDirectories,
+        imagePaths,
+        attachmentPaths,
+        message: input.message,
+        skills: selectedSkills,
+        processEnv,
+        larkAvailable,
+        providerConfig,
+        historyEvents,
+        onEvent: (normalized) => {
+          if (normalized.kind === "session.started") {
+            this.database.updateAiChatThread(threadId, {
+              providerSessionId: normalized.sessionId,
+            });
             return;
           }
+          if (normalized.kind !== "event") return;
           const event = this.database.insertAiChatEvent({
             threadId,
             runId: run.id,
@@ -318,37 +370,27 @@ export class AiChatService {
             content: normalized.content,
             data: normalized.data,
           });
-          if (raw.type === "turn.completed" && terminalOutcome === null) {
-            terminalOutcome = "completed";
-          } else if (raw.type === "turn.failed" || raw.type === "error") {
-            terminalOutcome = "failed";
-            terminalError ||= normalized.content;
-          }
           this.#emit(threadId, { type: "ai.event", event });
         },
       });
 
-      const active = { child, threadId, interrupted: false, temporaryDirectory };
+      const active = {
+        child: handle.child ?? null,
+        abortController: handle.abortController ?? null,
+        threadId,
+        interrupted: false,
+        temporaryDirectory,
+        label: handle.label ?? provider.displayName,
+        getTerminalOutcome: handle.getTerminalOutcome,
+        getTerminalError: handle.getTerminalError,
+        getStartedSessionId: handle.getStartedSessionId,
+        getResumeSessionId: handle.getResumeSessionId,
+        requiresSessionId: provider.requiresSessionId === true,
+      };
       this.active.set(run.id, active);
-      const finalization = completion.then(
-        (result) => this.#finishRun({
-          run,
-          active,
-          result,
-          resumingThreadId,
-          startedThreadId: () => startedThreadId,
-          terminalOutcome: () => terminalOutcome,
-          terminalError: () => terminalError,
-        }),
-        (error) => this.#finishRun({
-          run,
-          active,
-          error,
-          resumingThreadId,
-          startedThreadId: () => startedThreadId,
-          terminalOutcome: () => terminalOutcome,
-          terminalError: () => terminalError,
-        }),
+      const finalization = handle.completion.then(
+        (result) => this.#finishRun({ run, active, result }),
+        (error) => this.#finishRun({ run, active, error }),
       );
       this.completions.set(run.id, finalization);
       void finalization.finally(() => this.completions.delete(run.id)).catch(() => {});
@@ -377,11 +419,18 @@ export class AiChatService {
     }
 
     active.interrupted = true;
-    signalProcessGroup(active.child, "SIGTERM");
-    const timer = setTimeout(() => {
-      if (this.active.has(runId)) signalProcessGroup(active.child, "SIGKILL");
-    }, this.killGraceMs);
-    timer.unref();
+    if (active.abortController) {
+      try {
+        active.abortController.abort();
+      } catch {}
+    }
+    if (active.child) {
+      signalProcessGroup(active.child, "SIGTERM");
+      const timer = setTimeout(() => {
+        if (this.active.has(runId)) signalProcessGroup(active.child, "SIGKILL");
+      }, this.killGraceMs);
+      timer.unref();
+    }
 
     const completion = this.completions.get(runId);
     if (completion) {
@@ -394,7 +443,12 @@ export class AiChatService {
     const entries = [...this.active.entries()];
     for (const [, active] of entries) {
       active.interrupted = true;
-      signalProcessGroup(active.child, "SIGTERM");
+      if (active.abortController) {
+        try {
+          active.abortController.abort();
+        } catch {}
+      }
+      if (active.child) signalProcessGroup(active.child, "SIGTERM");
     }
 
     const completions = entries
@@ -404,24 +458,48 @@ export class AiChatService {
       const settled = Promise.allSettled(completions);
       await Promise.race([settled, wait(this.killGraceMs)]);
       for (const [runId, active] of entries) {
-        if (this.active.has(runId)) signalProcessGroup(active.child, "SIGKILL");
+        if (this.active.has(runId) && active.child) {
+          signalProcessGroup(active.child, "SIGKILL");
+        }
       }
       await settled;
     }
     this.listeners.clear();
   }
 
-  #resolveModel(catalog, requestedModel) {
+  #resolveProvider(catalog, requestedProvider) {
+    const available = (catalog.providers ?? []).filter((entry) => entry.available);
+    const providerId = requestedProvider === undefined
+      ? (available[0]?.id ?? this.providers.list()[0]?.id)
+      : requestedProvider;
+    const meta = (catalog.providers ?? []).find((entry) => entry.id === providerId);
+    const provider = this.providers.get(providerId);
+    if (!provider || !meta?.available) {
+      throw new ApiError(
+        400,
+        "INVALID_PROVIDER",
+        requestedProvider === undefined
+          ? "No AI provider is currently available"
+          : `Unknown or unavailable provider '${requestedProvider}'${meta?.reason ? `: ${meta.reason}` : ""}`,
+      );
+    }
+    return provider;
+  }
+
+  #resolveModel(catalog, requestedModel, providerId) {
+    const providerModels = catalog.models.filter((model) => (
+      (model.provider ?? "codex") === providerId
+    ));
     const model = requestedModel === undefined
-      ? catalog.models[0]
-      : catalog.models.find((candidate) => candidate.slug === requestedModel);
+      ? providerModels[0]
+      : providerModels.find((candidate) => candidate.slug === requestedModel);
     if (!model) {
       throw new ApiError(
         400,
         "INVALID_MODEL",
         requestedModel === undefined
-          ? "Codex did not provide an available model"
-          : `Unknown model '${requestedModel}'`,
+          ? `Provider '${providerId}' did not provide an available model`
+          : `Unknown model '${requestedModel}' for provider '${providerId}'`,
       );
     }
     return model;
@@ -438,7 +516,7 @@ export class AiChatService {
   }
 
   #validateSandbox(sandbox) {
-    if (!SANDBOXES.has(sandbox)) {
+    if (!SANDBOX_SET.has(sandbox)) {
       throw new ApiError(
         400,
         "INVALID_SANDBOX",
@@ -496,7 +574,7 @@ export class AiChatService {
         );
         await writeFile(attachmentPath, attachment.data, { flag: "wx", mode: 0o600 });
         attachmentPaths.push(attachmentPath);
-        if (CODEX_IMAGE_TYPES.has(attachment.contentType)) imagePaths.push(attachmentPath);
+        if (IMAGE_TYPES.has(attachment.contentType)) imagePaths.push(attachmentPath);
       }
       return { temporaryDirectory, attachmentPaths, imagePaths };
     } catch (error) {
@@ -510,16 +588,13 @@ export class AiChatService {
       || [...this.active.values()].some((active) => active.threadId === thread.id);
   }
 
-  async #finishRun({
-    run,
-    active,
-    result,
-    error,
-    resumingThreadId,
-    startedThreadId,
-    terminalOutcome,
-    terminalError,
-  }) {
+  async #finishRun({ run, active, result, error }) {
+    const label = active.label || "Provider";
+    const terminalOutcome = active.getTerminalOutcome?.() ?? null;
+    const terminalError = active.getTerminalError?.() ?? "";
+    const resumeSessionId = active.getResumeSessionId?.() ?? null;
+    const startedSessionId = active.getStartedSessionId?.() ?? null;
+
     let status;
     let publicError = null;
     if (active.interrupted) {
@@ -527,27 +602,27 @@ export class AiChatService {
       publicError = "Interrupted";
     } else if (error) {
       status = "failed";
-      publicError = cappedError(error) || "Codex turn failed";
-    } else if (terminalOutcome() === "failed") {
+      publicError = cappedError(error) || `${label} turn failed`;
+    } else if (terminalOutcome === "failed") {
       status = "failed";
-      publicError = terminalError() || "Codex reported a failed turn";
-    } else if (result.exitCode !== 0) {
+      publicError = terminalError || `${label} reported a failed turn`;
+    } else if (result?.exitCode !== 0 && result?.exitCode !== undefined) {
       status = "failed";
       publicError = result.exitCode === null
-        ? `Codex exited due to signal ${result.signal ?? "unknown"}`
-        : `Codex exited with code ${result.exitCode}`;
-    } else if (terminalOutcome() !== "completed") {
+        ? `${label} exited due to signal ${result.signal ?? "unknown"}`
+        : `${label} exited with code ${result.exitCode}`;
+    } else if (terminalOutcome !== "completed") {
       status = "failed";
-      publicError = "Codex exited without reporting turn completion";
-    } else if (!resumingThreadId && !startedThreadId()) {
+      publicError = `${label} exited without reporting turn completion`;
+    } else if (active.requiresSessionId && !resumeSessionId && !startedSessionId) {
       status = "failed";
-      publicError = "Codex did not provide a thread id";
+      publicError = `${label} did not provide a thread id`;
     } else {
       status = "completed";
     }
 
     try {
-      if (status === "failed" && terminalOutcome() !== "failed") {
+      if (status === "failed" && terminalOutcome !== "failed") {
         const errorEvent = this.database.insertAiChatEvent({
           threadId: run.threadId,
           runId: run.id,

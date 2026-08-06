@@ -137,6 +137,7 @@ function aiChatRunFromRow(row) {
 }
 
 function aiChatThreadFromRow(row) {
+  const providerSessionId = row.provider_session_id ?? row.codex_thread_id ?? null;
   return {
     id: row.id,
     title: row.title,
@@ -148,7 +149,10 @@ function aiChatThreadFromRow(row) {
       ...(row.origin_issue_id ? { issueId: row.origin_issue_id } : {}),
       ...(row.origin_issue_identifier ? { issueIdentifier: row.origin_issue_identifier } : {}),
     },
-    codexThreadId: row.codex_thread_id,
+    provider: row.provider ?? "codex",
+    providerSessionId,
+    // Backward-compatible alias for existing clients/tests.
+    codexThreadId: providerSessionId,
     model: row.model,
     reasoningEffort: row.reasoning_effort,
     sandbox: row.sandbox,
@@ -279,6 +283,8 @@ export class TaskboardDatabase {
         origin_workspace_path TEXT NOT NULL,
         origin_issue_id TEXT,
         origin_issue_identifier TEXT,
+        provider TEXT NOT NULL DEFAULT 'codex',
+        provider_session_id TEXT,
         codex_thread_id TEXT,
         model TEXT NOT NULL,
         reasoning_effort TEXT NOT NULL,
@@ -326,6 +332,21 @@ export class TaskboardDatabase {
         ON ai_chat_events(thread_id, created_at, id);
 
     `);
+
+    const aiChatThreadColumns = this.database.prepare("PRAGMA table_info(ai_chat_threads)").all();
+    if (!aiChatThreadColumns.some((column) => column.name === "provider")) {
+      this.database.exec(
+        "ALTER TABLE ai_chat_threads ADD COLUMN provider TEXT NOT NULL DEFAULT 'codex'",
+      );
+    }
+    if (!aiChatThreadColumns.some((column) => column.name === "provider_session_id")) {
+      this.database.exec("ALTER TABLE ai_chat_threads ADD COLUMN provider_session_id TEXT");
+      this.database.exec(`
+        UPDATE ai_chat_threads
+        SET provider_session_id = codex_thread_id
+        WHERE provider_session_id IS NULL AND codex_thread_id IS NOT NULL
+      `);
+    }
 
     const projectColumns = this.database.prepare("PRAGMA table_info(projects)").all();
     if (!projectColumns.some((column) => column.name === "workspace_path")) {
@@ -626,6 +647,19 @@ export class TaskboardDatabase {
     return row ? projectFromRow(row) : null;
   }
 
+  setProjectWorkspace(projectId, workspacePath) {
+    const timestamp = now();
+    const result = this.database.prepare(`
+      UPDATE projects
+      SET workspace_path = ?, updated_at = ?
+      WHERE id = ?
+    `).run(workspacePath, timestamp, projectId);
+    if (result.changes === 0) {
+      throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${projectId}' does not exist`);
+    }
+    return this.getProject(projectId);
+  }
+
   getWorkflowWorkspace(projectId) {
     if (!this.database.prepare("SELECT 1 FROM projects WHERE id = ?").get(projectId)) {
       throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${projectId}' does not exist`);
@@ -692,14 +726,16 @@ export class TaskboardDatabase {
   createAiChatThread(input) {
     const id = input.id ?? randomUUID();
     const timestamp = input.createdAt ?? now();
+    const providerSessionId = input.providerSessionId ?? input.codexThreadId ?? null;
     this.database.prepare(`
       INSERT INTO ai_chat_threads (
         id, title, status,
         origin_project_id, origin_project_name, origin_workspace_path,
         origin_issue_id, origin_issue_identifier,
-        codex_thread_id, model, reasoning_effort, sandbox,
+        provider, provider_session_id, codex_thread_id,
+        model, reasoning_effort, sandbox,
         created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       id,
       input.title,
@@ -709,7 +745,9 @@ export class TaskboardDatabase {
       input.origin.workspacePath,
       input.origin.issueId ?? null,
       input.origin.issueIdentifier ?? null,
-      input.codexThreadId ?? null,
+      input.provider ?? "codex",
+      providerSessionId,
+      providerSessionId,
       input.model,
       input.reasoningEffort,
       input.sandbox,
@@ -724,9 +762,17 @@ export class TaskboardDatabase {
     if (!current) {
       throw new ApiError(404, "AI_CHAT_THREAD_NOT_FOUND", `AI chat thread '${id}' does not exist`);
     }
+    const nextChanges = { ...changes };
+    if (Object.hasOwn(nextChanges, "providerSessionId") && !Object.hasOwn(nextChanges, "codexThreadId")) {
+      nextChanges.codexThreadId = nextChanges.providerSessionId;
+    } else if (Object.hasOwn(nextChanges, "codexThreadId") && !Object.hasOwn(nextChanges, "providerSessionId")) {
+      nextChanges.providerSessionId = nextChanges.codexThreadId;
+    }
     const columns = {
       title: "title",
       status: "status",
+      provider: "provider",
+      providerSessionId: "provider_session_id",
       codexThreadId: "codex_thread_id",
       model: "model",
       reasoningEffort: "reasoning_effort",
@@ -735,13 +781,13 @@ export class TaskboardDatabase {
     const assignments = [];
     const values = [];
     for (const [key, column] of Object.entries(columns)) {
-      if (!Object.hasOwn(changes, key)) continue;
+      if (!Object.hasOwn(nextChanges, key)) continue;
       assignments.push(`${column} = ?`);
-      values.push(changes[key]);
+      values.push(nextChanges[key]);
     }
     if (assignments.length === 0) return current;
     assignments.push("updated_at = ?");
-    values.push(changes.updatedAt ?? now(), id);
+    values.push(nextChanges.updatedAt ?? now(), id);
     this.database.prepare(`
       UPDATE ai_chat_threads SET ${assignments.join(", ")} WHERE id = ?
     `).run(...values);

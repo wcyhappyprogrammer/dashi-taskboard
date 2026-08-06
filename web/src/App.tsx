@@ -24,6 +24,8 @@ import {
   archiveTask as archiveTaskRequest,
   createProject as createProjectRequest,
   createTask as createTaskRequest,
+  getAiChatCatalog,
+  getLocalAutomation,
   getTaskboardRevision,
   getWorkflowWorkspace,
   getTaskboardMetadata,
@@ -34,16 +36,21 @@ import {
   moveTask as moveTaskRequest,
   removeTaskRelation,
   restoreTask as restoreTaskRequest,
+  saveLocalAutomation,
   setCurrentUserActor,
+  setProjectWorkspace,
   uploadAttachment,
   updateTask as updateTaskRequest,
 } from "./api";
+import type { AiChatCatalog, AiChatProviderId } from "./types";
 import {
   actorForAssigneeTarget,
   assigneeTargetForActor,
 } from "./actors";
 import { BoardColumn, STATUS_DETAILS } from "./components/BoardColumn";
 import { AiChat } from "./components/AiChat";
+import { AiProviderSettings } from "./components/AiProviderSettings";
+import { LarkSettings } from "./components/LarkSettings";
 import { BoardSettingsMenu } from "./components/BoardSettingsMenu";
 import { HiddenColumns } from "./components/HiddenColumns";
 import {
@@ -130,13 +137,13 @@ interface UndoNotice {
 type ColumnVisibilityByProject = Record<string, Partial<Record<TaskStatus, boolean>>>;
 type ProjectAutomationStatus = "ACTIVE" | "PAUSED";
 type AutomationQuotaState = "available" | "blocked" | "unknown" | "unavailable";
-type AutomationIntervalMinutes = 5 | 10 | 15 | 30 | 60;
+type AutomationIntervalMinutes = number;
 
 interface AutomationQuotaStatus {
   state: AutomationQuotaState;
   checkedAt: number;
   resetsAt?: number;
-  reason?: "api-key";
+  reason?: "api-key" | "local";
 }
 
 interface ProjectAutomationRecord {
@@ -147,8 +154,9 @@ interface ProjectAutomationRecord {
   quotaAware: boolean;
   quota?: AutomationQuotaStatus;
   intervalMinutes: AutomationIntervalMinutes;
-  model: AutomationModel;
-  reasoningEffort: AutomationReasoningEffort;
+  provider?: AiChatProviderId;
+  model: string;
+  reasoningEffort: string;
 }
 
 type ProjectAutomations = Record<string, ProjectAutomationRecord>;
@@ -156,8 +164,9 @@ type ProjectAutomations = Record<string, ProjectAutomationRecord>;
 interface AutomationHostItem {
   id: string;
   status: ProjectAutomationStatus;
-  model: AutomationModel;
-  reasoningEffort: AutomationReasoningEffort;
+  provider?: AiChatProviderId | null;
+  model: string;
+  reasoningEffort: string;
   rrule: string;
 }
 
@@ -172,8 +181,9 @@ interface AutomationHostResponse {
     enabledByUser: boolean;
     quotaAware: boolean;
     intervalMinutes: AutomationIntervalMinutes;
-    model: AutomationModel;
-    reasoningEffort: AutomationReasoningEffort;
+    provider?: AiChatProviderId | null;
+    model: string;
+    reasoningEffort: string;
   };
   error?: string;
 }
@@ -270,17 +280,32 @@ function readProjectAutomations(): ProjectAutomations {
       const reasoningEffort = candidate.reasoningEffort ?? "high";
       const enabledByUser = candidate.enabledByUser ?? candidate.status === "ACTIVE";
       const quotaAware = candidate.quotaAware ?? false;
+      const provider = candidate.provider;
+      const hasProvider = provider === "codex"
+        || provider === "claude-code"
+        || provider === "anthropic"
+        || provider === "deepseek"
+        || provider === "kimi"
+        || provider === "volcengine"
+        || provider === "aliyun"
+        || provider === "tencent";
+      const modelOk = hasProvider
+        ? typeof model === "string" && model.trim().length > 0
+        : (
+          isAutomationModel(model)
+          && isAutomationReasoningEffort(reasoningEffort)
+          && isSupportedModelEffort(model, reasoningEffort)
+        );
       if (
         (candidate.automationId !== undefined && typeof candidate.automationId !== "string")
         || typeof candidate.codexProjectId !== "string"
         || (candidate.status !== "ACTIVE" && candidate.status !== "PAUSED")
         || !isAutomationIntervalMinutes(candidate.intervalMinutes ?? 5)
-        || !isAutomationModel(model)
-        || !isAutomationReasoningEffort(reasoningEffort)
-        || !isSupportedModelEffort(model, reasoningEffort)
+        || !modelOk
         || (candidate.status === "ACTIVE" && !candidate.automationId)
         || typeof enabledByUser !== "boolean"
         || typeof quotaAware !== "boolean"
+        || (provider !== undefined && !hasProvider)
       ) continue;
       const quota = isAutomationQuotaStatus(candidate.quota) ? candidate.quota : undefined;
       result[projectId] = {
@@ -291,6 +316,7 @@ function readProjectAutomations(): ProjectAutomations {
         quotaAware,
         ...(quota ? { quota } : {}),
         intervalMinutes: candidate.intervalMinutes ?? 5,
+        ...(hasProvider ? { provider } : {}),
         model,
         reasoningEffort,
       };
@@ -311,7 +337,11 @@ function isAutomationQuotaStatus(value: unknown): value is AutomationQuotaStatus
       || candidate.state === "unavailable")
     && Number.isFinite(candidate.checkedAt)
     && (candidate.resetsAt === undefined || Number.isFinite(candidate.resetsAt))
-    && (candidate.reason === undefined || candidate.reason === "api-key")
+    && (
+      candidate.reason === undefined
+      || candidate.reason === "api-key"
+      || candidate.reason === "local"
+    )
   );
 }
 
@@ -324,19 +354,22 @@ function isAutomationHostPolicy(
     && typeof value.enabledByUser === "boolean"
     && typeof value.quotaAware === "boolean"
     && isAutomationIntervalMinutes(value.intervalMinutes)
-    && isAutomationModel(value.model)
-    && isAutomationReasoningEffort(value.reasoningEffort)
-    && isSupportedModelEffort(value.model, value.reasoningEffort),
+    && typeof value.model === "string"
+    && value.model.trim().length > 0
+    && typeof value.reasoningEffort === "string"
+    && value.reasoningEffort.trim().length > 0,
   );
 }
 
 function isAutomationIntervalMinutes(value: unknown): value is AutomationIntervalMinutes {
-  return value === 5 || value === 10 || value === 15 || value === 30 || value === 60;
+  return Number.isInteger(value) && Number(value) >= 1 && Number(value) <= 180;
 }
 
 function intervalMinutesFromRrule(value: string): AutomationIntervalMinutes | null {
-  const match = /^RRULE:FREQ=MINUTELY;INTERVAL=(5|10|15|30|60)$/.exec(value);
-  return match ? Number(match[1]) as AutomationIntervalMinutes : null;
+  const match = /^RRULE:FREQ=MINUTELY;INTERVAL=(\d+)$/.exec(value);
+  if (!match) return null;
+  const minutes = Number(match[1]);
+  return isAutomationIntervalMinutes(minutes) ? minutes : null;
 }
 
 function readColumnVisibilityByProject(): ColumnVisibilityByProject {
@@ -377,9 +410,10 @@ function isAutomationHostItem(value: unknown): value is AutomationHostItem {
   return (
     typeof item.id === "string"
     && (item.status === "ACTIVE" || item.status === "PAUSED")
-    && isAutomationModel(item.model)
-    && isAutomationReasoningEffort(item.reasoningEffort)
-    && isSupportedModelEffort(item.model, item.reasoningEffort)
+    && typeof item.model === "string"
+    && item.model.trim().length > 0
+    && typeof item.reasoningEffort === "string"
+    && item.reasoningEffort.trim().length > 0
     && typeof item.rrule === "string"
     && intervalMinutesFromRrule(item.rrule) !== null
   );
@@ -553,6 +587,11 @@ export function App() {
   const [showEmptyColumns, setShowEmptyColumns] = useState(readShowEmptyColumns);
   const [columnVisibilityByProject, setColumnVisibilityByProject] = useState(readColumnVisibilityByProject);
   const [boardView, setBoardView] = useState<BoardView>("issues");
+  const [settingsView, setSettingsView] = useState<"ai-providers" | "lark" | null>(() => {
+    const view = new URLSearchParams(window.location.search).get("view");
+    if (view === "ai-providers" || view === "lark") return view;
+    return null;
+  });
   const [editor, setEditor] = useState<EditorState | null>(null);
   const [detailTaskIdentifier, setDetailTaskIdentifier] = useState<string | null>(
     () => readIssueIdentifier(window.location.search),
@@ -575,6 +614,7 @@ export function App() {
   const [projectAutomations, setProjectAutomations] = useState(readProjectAutomations);
   const [automationPending, setAutomationPending] = useState(false);
   const [automationError, setAutomationError] = useState<string | null>(null);
+  const [automationCatalog, setAutomationCatalog] = useState<AiChatCatalog | null>(null);
   const [announcement, setAnnouncementValue] = useState("");
   const [undoNotice, setUndoNotice] = useState<UndoNotice | null>(null);
   const tasksRequestRef = useRef(0);
@@ -614,42 +654,115 @@ export function App() {
   const currentUser = hostContext?.user ?? DEFAULT_USER_ACTOR;
   const selectedDeviceWorkspacePath = deviceWorkspacePaths[selectedProjectId];
   const selectedProjectAutomation = projectAutomations[selectedProjectId];
-  const automationProjectContext = useMemo(() => {
-    if (!embedded || window.parent === window) {
-      return { unavailableReason: "仅可在 Codex App 中使用" };
-    }
-    if (!isLocalTaskboardOrigin(window.location.origin)) {
-      return { unavailableReason: "仅本地任务面板可用" };
-    }
-    if (!selectedProject) return { unavailableReason: "请先选择项目" };
 
-    const directCodexProject = hostContext?.projects?.some(
-      (project) => project.id === selectedProject.id,
+  const refreshAutomationCatalog = useCallback(async (projectId = selectedProjectId) => {
+    if (!projectId || !localAiChatAvailable) {
+      setAutomationCatalog(null);
+      return null;
+    }
+    try {
+      const catalog = await getAiChatCatalog(projectId);
+      setAutomationCatalog(catalog);
+      return catalog;
+    } catch (error) {
+      if ((error as Error).name !== "AbortError") {
+        setAutomationCatalog(null);
+      }
+      return null;
+    }
+  }, [localAiChatAvailable, selectedProjectId]);
+
+  useEffect(() => {
+    if (!selectedProjectId || !localAiChatAvailable) {
+      setAutomationCatalog(null);
+      return;
+    }
+    const controller = new AbortController();
+    void getAiChatCatalog(selectedProjectId, controller.signal).then(
+      (catalog) => {
+        if (!controller.signal.aborted) setAutomationCatalog(catalog);
+      },
+      (error) => {
+        if (!controller.signal.aborted && (error as Error).name !== "AbortError") {
+          setAutomationCatalog(null);
+        }
+      },
     );
-    const workspacePath = deviceWorkspacePaths[selectedProject.id]
-      ?? selectedProject.workspacePath
-      ?? (
-        directCodexProject && hostContext?.projectId === selectedProject.id
-          ? hostContext.workspacePath
-          : undefined
-      );
-    const codexProjectId = directCodexProject
-      ? selectedProject.id
-      : hostContext?.projects?.find(
-        (project) => deviceWorkspacePaths[project.id] === workspacePath,
-      )?.id;
+    return () => controller.abort();
+  }, [localAiChatAvailable, selectedProjectId]);
 
-    if (!workspacePath || !codexProjectId) {
-      return { unavailableReason: "请先在 Codex 中添加并映射该项目目录" };
+  const automationProjectContext = useMemo(() => {
+    if (!isLocalTaskboardOrigin(window.location.origin)) {
+      return { mode: null as "codex-host" | "local" | null, unavailableReason: "仅本地任务面板可用" };
+    }
+    if (!selectedProject) {
+      return { mode: null as "codex-host" | "local" | null, unavailableReason: "请先选择项目" };
     }
     if (!manageTaskboardSkillPath) {
-      return { unavailableReason: "任务面板还没有读取到 Skill 路径" };
+      return {
+        mode: null as "codex-host" | "local" | null,
+        unavailableReason: "任务面板还没有读取到 Skill 路径",
+      };
     }
-    return { workspacePath, codexProjectId, unavailableReason: null };
+
+    const hostEmbedded = embedded && window.parent !== window;
+    if (hostEmbedded) {
+      const directCodexProject = hostContext?.projects?.some(
+        (project) => project.id === selectedProject.id,
+      );
+      const workspacePath = deviceWorkspacePaths[selectedProject.id]
+        ?? selectedProject.workspacePath
+        ?? (
+          directCodexProject && hostContext?.projectId === selectedProject.id
+            ? hostContext.workspacePath
+            : undefined
+        );
+      const codexProjectId = directCodexProject
+        ? selectedProject.id
+        : hostContext?.projects?.find(
+          (project) => deviceWorkspacePaths[project.id] === workspacePath,
+        )?.id;
+
+      if (!workspacePath || !codexProjectId) {
+        return {
+          mode: null as "codex-host" | "local" | null,
+          unavailableReason: "请先在 Codex 中添加并映射该项目目录",
+        };
+      }
+      return {
+        mode: "codex-host" as const,
+        workspacePath,
+        codexProjectId,
+        unavailableReason: null,
+      };
+    }
+
+    if (!localAiChatAvailable) {
+      return {
+        mode: null as "codex-host" | "local" | null,
+        unavailableReason: "本地 AI 对话不可用，请确认 Taskboard 服务已启动",
+      };
+    }
+    const workspacePath = deviceWorkspacePaths[selectedProject.id]
+      ?? selectedProject.workspacePath
+      ?? undefined;
+    if (!workspacePath) {
+      return {
+        mode: null as "codex-host" | "local" | null,
+        unavailableReason: "请先为项目配置本机工作区目录",
+      };
+    }
+    return {
+      mode: "local" as const,
+      workspacePath,
+      codexProjectId: selectedProject.id,
+      unavailableReason: null,
+    };
   }, [
     deviceWorkspacePaths,
     embedded,
     hostContext,
+    localAiChatAvailable,
     manageTaskboardSkillPath,
     selectedProject,
   ]);
@@ -720,6 +833,7 @@ export function App() {
         && current[projectId]?.quotaAware === record.quotaAware
         && JSON.stringify(current[projectId]?.quota) === JSON.stringify(record.quota)
         && current[projectId]?.intervalMinutes === record.intervalMinutes
+        && current[projectId]?.provider === record.provider
         && current[projectId]?.model === record.model
         && current[projectId]?.reasoningEffort === record.reasoningEffort
       ) {
@@ -738,7 +852,7 @@ export function App() {
     operation: "ensure-active" | "pause" | "list" | "apply-policy",
     options: Pick<
       ProjectAutomationRecord,
-      "enabledByUser" | "quotaAware" | "intervalMinutes" | "model" | "reasoningEffort"
+      "enabledByUser" | "quotaAware" | "intervalMinutes" | "provider" | "model" | "reasoningEffort"
     >,
     automationId?: string,
   ) => {
@@ -746,11 +860,39 @@ export function App() {
       !selectedProject
       || !automationProjectContext.codexProjectId
       || !automationProjectContext.workspacePath
+      || !automationProjectContext.mode
     ) {
       return Promise.reject(new Error(
         automationProjectContext.unavailableReason ?? "无法读取项目自动化信息",
       ));
     }
+
+    if (automationProjectContext.mode === "local") {
+      const requestId = window.crypto.randomUUID();
+      if (operation === "list") {
+        return getLocalAutomation(selectedProjectId).then((data) => ({
+          requestId,
+          ok: true,
+          ...data,
+          items: data.items ?? (data.item ? [data.item] : []),
+          policy: data.policy ?? undefined,
+        } as AutomationHostResponse));
+      }
+      return saveLocalAutomation({
+        projectId: selectedProjectId,
+        enabledByUser: options.enabledByUser,
+        intervalMinutes: options.intervalMinutes,
+        provider: options.provider ?? null,
+        model: options.model,
+        reasoningEffort: options.reasoningEffort,
+      }).then((data) => ({
+        requestId,
+        ok: true,
+        ...data,
+        items: data.item ? [data.item] : [],
+      } as AutomationHostResponse));
+    }
+
     const requestId = window.crypto.randomUUID();
     const response = new Promise<AutomationHostResponse>((resolve, reject) => {
       const timeoutId = window.setTimeout(() => {
@@ -820,6 +962,7 @@ export function App() {
           enabledByUser: policy.enabledByUser,
           quotaAware: policy.quotaAware,
           intervalMinutes: policy.intervalMinutes,
+          ...(policy.provider ? { provider: policy.provider } : {}),
           model: policy.model,
           reasoningEffort: policy.reasoningEffort,
         });
@@ -849,6 +992,7 @@ export function App() {
         quotaAware: stored.quotaAware,
         ...(response.quota ? { quota: response.quota } : {}),
         intervalMinutes,
+        ...(item.provider ? { provider: item.provider } : stored.provider ? { provider: stored.provider } : {}),
         model: item.model,
         reasoningEffort: item.reasoningEffort,
       });
@@ -869,8 +1013,9 @@ export function App() {
     enabledByUser: boolean;
     quotaAware: boolean;
     intervalMinutes: AutomationIntervalMinutes;
-    model: AutomationModel;
-    reasoningEffort: AutomationReasoningEffort;
+    provider?: AiChatProviderId;
+    model: string;
+    reasoningEffort: string;
   }) => {
     const stored = projectAutomations[selectedProjectId];
     if (
@@ -884,18 +1029,27 @@ export function App() {
     setAutomationPending(true);
     setAutomationError(null);
     try {
-      const response = await sendAutomationRequest("apply-policy", options, stored?.automationId);
+      const nextOptions = automationProjectContext.mode === "local"
+        ? { ...options, quotaAware: false }
+        : options;
+      const response = await sendAutomationRequest("apply-policy", nextOptions, stored?.automationId);
       const item = isAutomationHostItem(response.item) ? response.item : undefined;
+      const provider = (
+        (item?.provider as AiChatProviderId | null | undefined)
+        ?? nextOptions.provider
+        ?? stored?.provider
+      );
       writeProjectAutomation(selectedProjectId, {
         automationId: item?.id,
         codexProjectId: automationProjectContext.codexProjectId,
         status: item?.status ?? "PAUSED",
-        enabledByUser: options.enabledByUser,
-        quotaAware: options.quotaAware,
+        enabledByUser: nextOptions.enabledByUser,
+        quotaAware: nextOptions.quotaAware,
         ...(response.quota ? { quota: response.quota } : {}),
-        intervalMinutes: options.intervalMinutes,
-        model: options.model,
-        reasoningEffort: options.reasoningEffort,
+        intervalMinutes: nextOptions.intervalMinutes,
+        ...(provider ? { provider } : {}),
+        model: nextOptions.model,
+        reasoningEffort: nextOptions.reasoningEffort,
       });
     } catch (error) {
       writeProjectAutomation(selectedProjectId, previousRecord);
@@ -939,7 +1093,17 @@ export function App() {
     function syncRouteFromLocation() {
       const url = new URL(window.location.href);
       const routeProjectId = url.searchParams.get("project") ?? "";
+      const routeView = url.searchParams.get("view");
+      setSettingsView(
+        routeView === "ai-providers" || routeView === "lark"
+          ? routeView
+          : null,
+      );
       setDetailTaskIdentifier(readIssueIdentifier(url.search));
+      if (routeView === "ai-providers" || routeView === "lark") {
+        setSelectedProjectId("");
+        return;
+      }
       if (routeProjectId === selectedProjectId) return;
       setBoardView("issues");
       setSelectedProjectId(routeProjectId);
@@ -1734,6 +1898,7 @@ export function App() {
     closeContextMenu();
     setProjectMenuOpen(false);
     setDetailTaskIdentifier(null);
+    setSettingsView(null);
     setBoardView("issues");
     setSelectedProjectId(projectId);
     window.localStorage.setItem(LAST_PROJECT_KEY, projectId);
@@ -1742,7 +1907,8 @@ export function App() {
     setActionError(null);
     undoStackRef.current = [];
     setUndoNotice(null);
-    const url = buildIssueUrl(window.location.href, projectId, null);
+    const url = new URL(buildIssueUrl(window.location.href, projectId, null));
+    url.searchParams.delete("view");
     window.history.replaceState(null, "", url);
   }
 
@@ -1750,6 +1916,7 @@ export function App() {
     closeContextMenu();
     setProjectMenuOpen(false);
     setDetailTaskIdentifier(null);
+    setSettingsView(null);
     setSelectedProjectId("");
     window.localStorage.removeItem(LAST_PROJECT_KEY);
     setSearch("");
@@ -1757,7 +1924,50 @@ export function App() {
     setActionError(null);
     undoStackRef.current = [];
     setUndoNotice(null);
-    const url = buildIssueUrl(window.location.href, null, null);
+    const url = new URL(buildIssueUrl(window.location.href, null, null));
+    url.searchParams.delete("view");
+    window.history.replaceState(null, "", url);
+    void loadProjectList();
+  }
+
+  function openAiProviderSettings() {
+    closeContextMenu();
+    setProjectMenuOpen(false);
+    setDetailTaskIdentifier(null);
+    setSelectedProjectId("");
+    setSettingsView("ai-providers");
+    const url = new URL(window.location.href);
+    url.searchParams.delete("project");
+    url.searchParams.delete("issue");
+    url.searchParams.set("view", "ai-providers");
+    window.history.pushState(null, "", url);
+  }
+
+  function closeAiProviderSettings() {
+    setSettingsView(null);
+    const url = new URL(window.location.href);
+    url.searchParams.delete("view");
+    window.history.replaceState(null, "", url);
+    void loadProjectList();
+  }
+
+  function openLarkSettings() {
+    closeContextMenu();
+    setProjectMenuOpen(false);
+    setDetailTaskIdentifier(null);
+    setSelectedProjectId("");
+    setSettingsView("lark");
+    const url = new URL(window.location.href);
+    url.searchParams.delete("project");
+    url.searchParams.delete("issue");
+    url.searchParams.set("view", "lark");
+    window.history.pushState(null, "", url);
+  }
+
+  function closeLarkSettings() {
+    setSettingsView(null);
+    const url = new URL(window.location.href);
+    url.searchParams.delete("view");
     window.history.replaceState(null, "", url);
     void loadProjectList();
   }
@@ -1864,6 +2074,26 @@ export function App() {
               <span aria-hidden="true" />
               {connection === "live" ? "实时同步" : "正在重新连接…"}
             </div>
+            {localAiChatAvailable && (
+              <button
+                type="button"
+                className={`theme-toggle${settingsView === "ai-providers" ? " is-active" : ""}`}
+                onClick={openAiProviderSettings}
+                aria-current={settingsView === "ai-providers" ? "page" : undefined}
+              >
+                <span aria-hidden="true"><LinearIcon name="displayOptions" /></span>
+                AI 配置
+              </button>
+            )}
+            <button
+              type="button"
+              className={`theme-toggle${settingsView === "lark" ? " is-active" : ""}`}
+              onClick={openLarkSettings}
+              aria-current={settingsView === "lark" ? "page" : undefined}
+            >
+              <span aria-hidden="true"><LinearIcon name="conversation" /></span>
+              飞书
+            </button>
             <button
               type="button"
               className="theme-toggle"
@@ -1878,6 +2108,19 @@ export function App() {
       )}
 
       <main className="workspace">
+        {settingsView === "ai-providers" ? (
+          <AiProviderSettings
+            projects={projects}
+            initialProjectId={null}
+            onClose={closeAiProviderSettings}
+          />
+        ) : settingsView === "lark" ? (
+          <LarkSettings
+            projects={projects}
+            onClose={closeLarkSettings}
+          />
+        ) : (
+          <>
         {selectedProjectId ? (
           <header className="workspace-header">
           <div className="workspace-title">
@@ -1996,8 +2239,40 @@ export function App() {
                 pending={automationPending}
                 error={automationError}
                 unavailableReason={automationProjectContext.unavailableReason}
-                onOpen={() => void reconcileProjectAutomation()}
+                runtime={automationProjectContext.mode}
+                catalog={automationCatalog}
+                runtimeNote={
+                  automationProjectContext.mode === "local"
+                    ? "由本机 Taskboard 服务调度。先选 AI Provider，再选对应模型；间隔可填 1–180 分钟。"
+                    : null
+                }
+                workspacePathHint={
+                  selectedDeviceWorkspacePath
+                  ?? selectedProject?.workspacePath
+                  ?? null
+                }
+                onOpen={() => {
+                  void refreshAutomationCatalog();
+                  void reconcileProjectAutomation();
+                }}
                 onChange={(options) => void saveProjectAutomation(options)}
+                onSaveWorkspace={async (workspacePath) => {
+                  if (!selectedProjectId) return;
+                  setAutomationPending(true);
+                  setAutomationError(null);
+                  try {
+                    const project = await setProjectWorkspace(selectedProjectId, workspacePath);
+                    rememberDeviceWorkspacePath(selectedProjectId, project.workspacePath ?? workspacePath);
+                    setProjects((current) => current.map((entry) => (
+                      entry.id === project.id ? { ...entry, ...project } : entry
+                    )));
+                    setAnnouncement(`已设置工作区：${project.workspacePath ?? workspacePath}`);
+                  } catch (error) {
+                    setAutomationError(error instanceof Error ? error.message : "无法保存工作区");
+                  } finally {
+                    setAutomationPending(false);
+                  }
+                }}
               />
             )}
             {selectedProjectId && boardView === "issues" && (
@@ -2283,6 +2558,8 @@ export function App() {
               )}
             </div>
           </div>
+        )}
+          </>
         )}
       </main>
 

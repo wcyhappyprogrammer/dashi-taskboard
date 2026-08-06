@@ -24,6 +24,8 @@ const thread = {
     issueId: "issue-1",
     issueIdentifier: "LOCAL-103",
   },
+  provider: "codex",
+  providerSessionId: null,
   codexThreadId: null,
   model: "codex-real",
   reasoningEffort: "high",
@@ -47,7 +49,15 @@ test("local AI API client follows the fixed catalog, thread, turn and interrupt 
     calls.push({ path, init });
     if (String(path).startsWith("/api/local/ai/catalog")) {
       return json({
+        providers: [{
+          id: "codex",
+          displayName: "Codex",
+          available: true,
+          supportsSkills: true,
+          supportsSandbox: true,
+        }],
         models: [{
+          provider: "codex",
           slug: "codex-real",
           displayName: "Codex Real",
           description: "Local catalog",
@@ -55,7 +65,7 @@ test("local AI API client follows the fixed catalog, thread, turn and interrupt 
           supportedReasoningEfforts: ["high"],
           serviceTiers: [],
         }],
-        skills: [{ id: "real-skill", label: "Real Skill", scope: "user" }],
+        skills: [{ provider: "codex", id: "real-skill", label: "Real Skill", scope: "user" }],
         sandboxes: ["read-only", "workspace-write", "danger-full-access"],
       });
     }

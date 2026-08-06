@@ -403,6 +403,10 @@ export const PALETTE_ITEMS: PaletteItem[] = [
       tone: "integration",
       inputLabel: "文档参数",
       outputLabel: "文档内容",
+      feishuDocsAction: "create",
+      feishuDocTitle: "",
+      feishuDocContent: "",
+      feishuDocToken: "",
     },
   },
   {
@@ -423,6 +427,7 @@ export const PALETTE_ITEMS: PaletteItem[] = [
       feishuRecipientType: "self",
       feishuUserId: "",
       feishuChatId: "",
+      feishuMessageText: "",
     },
   },
   {
